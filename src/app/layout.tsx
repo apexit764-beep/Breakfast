@@ -15,6 +15,9 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "فطور اليوم",
   description: "تنظيم طلبات الفطور اليومية للموظفين",
+  other: {
+    "color-scheme": "light",
+  },
 };
 
 export default function RootLayout({
