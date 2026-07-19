@@ -7,6 +7,7 @@ import { useRequireAdmin } from "@/lib/useRequireAdmin";
 import { supabase } from "@/lib/supabase";
 import type { Restaurant } from "@/lib/types";
 import MenuManager from "./MenuManager";
+import BillingSettings from "./BillingSettings";
 
 function RestaurantMenuContent() {
   const searchParams = useSearchParams();
@@ -51,6 +52,7 @@ function RestaurantMenuContent() {
       </Link>
       <h1 className="mb-1 text-2xl font-bold">منيو {restaurant.name}</h1>
       <p className="mb-6 text-sm text-zinc-500">أضف وعدّل الأصناف المتوفرة في هذا المطعم</p>
+      <BillingSettings restaurant={restaurant} onSaved={setRestaurant} />
       <MenuManager restaurantId={restaurant.id} />
     </div>
   );

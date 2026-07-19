@@ -1,9 +1,15 @@
+export type DiscountType = "percentage" | "fixed";
+
 export type Restaurant = {
   id: string;
   name: string;
   description: string | null;
   is_active: boolean;
   created_at: string;
+  delivery_fee: number;
+  service_fee: number;
+  discount_type: DiscountType | null;
+  discount_value: number;
 };
 
 export type MenuItem = {
