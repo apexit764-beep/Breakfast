@@ -1,24 +1,40 @@
+"use client";
+
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { todayDateString } from "@/lib/date";
 
-export const revalidate = 0;
+type SelectionRow = {
+  restaurant: { id: string; name: string; description: string | null; is_active: boolean } | null;
+};
 
-export default async function EmployeeHomePage() {
-  const date = todayDateString();
+type RestaurantSummary = {
+  id: string;
+  name: string;
+  description: string | null;
+  is_active: boolean;
+};
 
-  type SelectionRow = {
-    restaurant: { id: string; name: string; description: string | null; is_active: boolean } | null;
-  };
+export default function EmployeeHomePage() {
+  const [restaurants, setRestaurants] = useState<RestaurantSummary[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const { data: selections } = await supabase
-    .from("daily_selections")
-    .select("restaurant:restaurants(id,name,description,is_active)")
-    .eq("selection_date", date);
-
-  const restaurants = ((selections ?? []) as unknown as SelectionRow[])
-    .map((s) => s.restaurant)
-    .filter((r): r is NonNullable<SelectionRow["restaurant"]> => !!r && r.is_active);
+  useEffect(() => {
+    const date = todayDateString();
+    supabase
+      .from("daily_selections")
+      .select("restaurant:restaurants(id,name,description,is_active)")
+      .eq("selection_date", date)
+      .then(({ data }) => {
+        const rows = (data ?? []) as unknown as SelectionRow[];
+        const list = rows
+          .map((s) => s.restaurant)
+          .filter((r): r is NonNullable<SelectionRow["restaurant"]> => !!r && r.is_active);
+        setRestaurants(list);
+        setLoading(false);
+      });
+  }, []);
 
   return (
     <div className="flex flex-1 flex-col items-center px-4 py-10">
@@ -28,7 +44,9 @@ export default async function EmployeeHomePage() {
           اختر مطعم من اقتراحات اليوم لتشوف المنيو وتسجل طلبك
         </p>
 
-        {restaurants.length === 0 ? (
+        {loading ? (
+          <p className="text-sm text-zinc-500">جاري التحميل...</p>
+        ) : restaurants.length === 0 ? (
           <div className="rounded-xl bg-white p-6 text-center ring-1 ring-zinc-200">
             <p className="text-zinc-600">
               لسا ما في مطاعم مقترحة لليوم. تواصل مع الأدمن لإضافة اقتراحات اليوم.
@@ -39,7 +57,7 @@ export default async function EmployeeHomePage() {
             {restaurants.map((r) => (
               <li key={r.id}>
                 <Link
-                  href={`/order/${r.id}`}
+                  href={`/order?restaurantId=${r.id}`}
                   className="flex items-center justify-between rounded-xl bg-white p-4 ring-1 ring-zinc-200 transition hover:ring-orange-400"
                 >
                   <div>

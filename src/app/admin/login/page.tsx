@@ -2,30 +2,24 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { isValidAdminPassword, setAdminAuthed } from "@/lib/auth";
 
 export default function AdminLoginPage() {
   const router = useRouter();
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
 
-  async function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true);
     setError(null);
-    const res = await fetch("/api/admin/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    setLoading(false);
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      setError(data.error ?? "حدث خطأ، حاول مرة أخرى");
+
+    if (!isValidAdminPassword(password)) {
+      setError("كلمة السر غير صحيحة");
       return;
     }
+
+    setAdminAuthed();
     router.push("/admin");
-    router.refresh();
   }
 
   return (
@@ -47,10 +41,9 @@ export default function AdminLoginPage() {
         {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
         <button
           type="submit"
-          disabled={loading}
-          className="w-full rounded-lg bg-orange-500 px-4 py-2 text-sm font-semibold text-white hover:bg-orange-600 disabled:opacity-50"
+          className="w-full rounded-lg bg-orange-500 px-4 py-2 text-sm font-semibold text-white hover:bg-orange-600"
         >
-          {loading ? "جاري الدخول..." : "دخول"}
+          دخول
         </button>
       </form>
     </div>

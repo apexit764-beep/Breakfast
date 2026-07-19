@@ -1,7 +1,13 @@
+"use client";
+
+import { useRequireAdmin } from "@/lib/useRequireAdmin";
 import TodaySelector from "./TodaySelector";
 import { todayDateString } from "@/lib/date";
 
 export default function TodaySelectionPage() {
+  const ready = useRequireAdmin();
+  if (!ready) return null;
+
   const date = todayDateString();
   return (
     <div>
