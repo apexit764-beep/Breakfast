@@ -127,7 +127,7 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
                 <div className="flex items-center gap-2">
                   <span className="font-semibold">{item.name}</span>
                   {item.price != null && (
-                    <span className="text-sm text-zinc-500">{item.price} د.أ</span>
+                    <span className="text-sm text-zinc-500">{item.price} ج.م</span>
                   )}
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${

@@ -125,7 +125,7 @@ export default function OrderForm({
                   <p className="text-sm text-zinc-500">{item.description}</p>
                 )}
                 {item.price != null && (
-                  <p className="text-sm text-zinc-500">{item.price} د.أ</p>
+                  <p className="text-sm text-zinc-500">{item.price} ج.م</p>
                 )}
               </div>
               <div className="flex items-center gap-2">

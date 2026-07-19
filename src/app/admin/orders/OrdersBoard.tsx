@@ -219,7 +219,7 @@ function RestaurantInvoice({ group }: { group: RestaurantGroup }) {
               <li key={idx} className="rounded-lg border border-zinc-200 p-3">
                 <div className="mb-1 flex items-center justify-between">
                   <span className="font-semibold">{emp.name}</span>
-                  <span className="font-bold text-orange-600">{formatMoney(total)} د.أ</span>
+                  <span className="font-bold text-orange-600">{formatMoney(total)} ج.م</span>
                 </div>
                 <p className="text-sm text-zinc-600">
                   {emp.items
@@ -228,11 +228,11 @@ function RestaurantInvoice({ group }: { group: RestaurantGroup }) {
                 </p>
                 {emp.notes && <p className="text-xs text-zinc-400">({emp.notes})</p>}
                 <div className="mt-1 flex justify-between text-xs text-zinc-400">
-                  <span>قيمة الطلب: {formatMoney(emp.subtotal)} د.أ</span>
+                  <span>قيمة الطلب: {formatMoney(emp.subtotal)} ج.م</span>
                   {extraTotal !== 0 && (
                     <span>
                       نصيبه من التوصيل/الخدمة/الخصم: {perPersonExtra >= 0 ? "+" : ""}
-                      {formatMoney(perPersonExtra)} د.أ
+                      {formatMoney(perPersonExtra)} ج.م
                     </span>
                   )}
                 </div>
@@ -245,18 +245,18 @@ function RestaurantInvoice({ group }: { group: RestaurantGroup }) {
       <div className="border-t border-zinc-200 pt-3 text-sm">
         <div className="flex justify-between text-zinc-600">
           <span>مجموع الطلبات</span>
-          <span>{formatMoney(subtotalAll)} د.أ</span>
+          <span>{formatMoney(subtotalAll)} ج.م</span>
         </div>
         {group.deliveryFee > 0 && (
           <div className="flex justify-between text-zinc-600">
             <span>رسوم التوصيل</span>
-            <span>{formatMoney(group.deliveryFee)} د.أ</span>
+            <span>{formatMoney(group.deliveryFee)} ج.م</span>
           </div>
         )}
         {group.serviceFee > 0 && (
           <div className="flex justify-between text-zinc-600">
             <span>رسوم الخدمة</span>
-            <span>{formatMoney(group.serviceFee)} د.أ</span>
+            <span>{formatMoney(group.serviceFee)} ج.م</span>
           </div>
         )}
         {discountAmount > 0 && (
@@ -264,12 +264,12 @@ function RestaurantInvoice({ group }: { group: RestaurantGroup }) {
             <span>
               الخصم {group.discountType === "percentage" ? `(${group.discountValue}%)` : ""}
             </span>
-            <span>−{formatMoney(discountAmount)} د.أ</span>
+            <span>−{formatMoney(discountAmount)} ج.م</span>
           </div>
         )}
         <div className="mt-1 flex justify-between text-base font-bold text-zinc-900">
           <span>الإجمالي الكلي</span>
-          <span>{formatMoney(grandTotal)} د.أ</span>
+          <span>{formatMoney(grandTotal)} ج.م</span>
         </div>
       </div>
     </div>

@@ -95,7 +95,7 @@ export default function BillingSettings({
         </div>
         <div>
           <label className="mb-1 block text-xs font-medium text-zinc-500">
-            قيمة الخصم {discountType === "percentage" ? "(%)" : "(د.أ)"}
+            قيمة الخصم {discountType === "percentage" ? "(%)" : "(ج.م)"}
           </label>
           <input
             value={discountValue}
