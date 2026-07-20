@@ -21,6 +21,13 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
   const [variantPrice, setVariantPrice] = useState("");
   const [savingVariant, setSavingVariant] = useState(false);
 
+  const [editingItem, setEditingItem] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editPrice, setEditPrice] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editCategory, setEditCategory] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+
   const categories = Array.from(new Set(items.map((i) => i.category).filter(Boolean))) as string[];
 
   async function load() {
@@ -103,6 +110,36 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
     }
     setVariantLabel("");
     setVariantPrice("");
+    load();
+  }
+
+  function startEditing(item: ItemWithVariants) {
+    setEditingItem(item.id);
+    setEditName(item.name);
+    setEditPrice(item.price != null ? String(item.price) : "");
+    setEditDescription(item.description || "");
+    setEditCategory(item.category || "");
+  }
+
+  async function saveEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editingItem || !editName.trim()) return;
+    setSavingEdit(true);
+    const { error } = await supabase
+      .from("menu_items")
+      .update({
+        name: editName.trim(),
+        price: editPrice.trim() ? Number(editPrice) : null,
+        description: editDescription.trim() || null,
+        category: editCategory.trim() || null,
+      })
+      .eq("id", editingItem);
+    setSavingEdit(false);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    setEditingItem(null);
     load();
   }
 
@@ -206,6 +243,64 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
                     key={item.id}
                     className="rounded-xl bg-white p-4 ring-1 ring-zinc-200"
                   >
+                    {editingItem === item.id ? (
+                      <form onSubmit={saveEdit} className="flex flex-col gap-3">
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          <div>
+                            <label className="mb-1 block text-xs font-medium text-zinc-500">اسم الصنف</label>
+                            <input
+                              value={editName}
+                              onChange={(e) => setEditName(e.target.value)}
+                              className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-orange-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-1 block text-xs font-medium text-zinc-500">التصنيف</label>
+                            <input
+                              value={editCategory}
+                              onChange={(e) => setEditCategory(e.target.value)}
+                              list="categories-list"
+                              className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-orange-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-1 block text-xs font-medium text-zinc-500">السعر</label>
+                            <input
+                              value={editPrice}
+                              onChange={(e) => setEditPrice(e.target.value)}
+                              inputMode="decimal"
+                              placeholder="اختياري"
+                              className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-orange-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-1 block text-xs font-medium text-zinc-500">وصف</label>
+                            <input
+                              value={editDescription}
+                              onChange={(e) => setEditDescription(e.target.value)}
+                              placeholder="اختياري"
+                              className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-orange-500"
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="submit"
+                            disabled={savingEdit}
+                            className="rounded-lg bg-orange-500 px-4 py-1.5 text-sm font-semibold text-white hover:bg-orange-600 disabled:opacity-50"
+                          >
+                            حفظ
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingItem(null)}
+                            className="rounded-lg bg-zinc-100 px-4 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-200"
+                          >
+                            إلغاء
+                          </button>
+                        </div>
+                      </form>
+                    ) : (
                     <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
                       <div>
                         <div className="flex items-center gap-2">
@@ -227,7 +322,13 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
                           <p className="mt-1 text-sm text-zinc-500">{item.description}</p>
                         )}
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={() => startEditing(item)}
+                          className="rounded-lg bg-orange-50 px-3 py-1.5 text-sm font-medium text-orange-600 hover:bg-orange-100"
+                        >
+                          تعديل
+                        </button>
                         <button
                           onClick={() => setVariantItemId(variantItemId === item.id ? null : item.id)}
                           className="rounded-lg bg-blue-50 px-3 py-1.5 text-sm font-medium text-blue-600 hover:bg-blue-100"
@@ -248,6 +349,7 @@ export default function MenuManager({ restaurantId }: { restaurantId: string }) 
                         </button>
                       </div>
                     </div>
+                    )}
 
                     {item.variants.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-2">
