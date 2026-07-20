@@ -4,14 +4,16 @@ import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import type { MenuItem, Restaurant } from "@/lib/types";
+import type { MenuItem, MenuItemVariant, Restaurant } from "@/lib/types";
 import OrderForm from "./OrderForm";
+
+type ItemWithVariants = MenuItem & { variants: MenuItemVariant[] };
 
 function OrderPageContent() {
   const searchParams = useSearchParams();
   const restaurantId = searchParams.get("restaurantId");
   const [restaurant, setRestaurant] = useState<Restaurant | null>(null);
-  const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
+  const [menuItems, setMenuItems] = useState<ItemWithVariants[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -24,13 +26,17 @@ function OrderPageContent() {
       supabase.from("restaurants").select("*").eq("id", restaurantId).single(),
       supabase
         .from("menu_items")
-        .select("*")
+        .select("*, variants:menu_item_variants(*)")
         .eq("restaurant_id", restaurantId)
         .eq("is_available", true)
         .order("created_at", { ascending: true }),
     ]).then(([{ data: restaurantData }, { data: menuData }]) => {
       setRestaurant(restaurantData ?? null);
-      setMenuItems(menuData ?? []);
+      const rows = (menuData ?? []) as unknown as ItemWithVariants[];
+      for (const row of rows) {
+        row.variants = (row.variants ?? []).sort((a, b) => a.sort_order - b.sort_order);
+      }
+      setMenuItems(rows);
       setLoading(false);
     });
   }, [restaurantId]);

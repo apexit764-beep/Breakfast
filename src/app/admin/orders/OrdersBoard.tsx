@@ -19,12 +19,13 @@ type RawOrder = {
   order_items: {
     quantity: number;
     menu_item: { id: string; name: string; price: number | null } | null;
+    variant: { id: string; label: string; price: number } | null;
   }[];
 };
 
 type EmployeeOrder = {
   name: string;
-  items: { name: string; quantity: number; price: number; lineTotal: number }[];
+  items: { name: string; variantLabel: string | null; quantity: number; price: number; lineTotal: number }[];
   notes: string | null;
   subtotal: number;
 };
@@ -54,7 +55,7 @@ export default function OrdersBoard({ date }: { date: string }) {
     const { data, error } = await supabase
       .from("orders")
       .select(
-        "id, employee_name, notes, restaurant:restaurants(id,name,delivery_fee,service_fee,discount_type,discount_value), order_items(quantity, menu_item:menu_items(id,name,price))"
+        "id, employee_name, notes, restaurant:restaurants(id,name,delivery_fee,service_fee,discount_type,discount_value), order_items(quantity, menu_item:menu_items(id,name,price), variant:menu_item_variants(id,label,price))"
       )
       .eq("order_date", date)
       .order("created_at", { ascending: true });
@@ -88,14 +89,19 @@ export default function OrdersBoard({ date }: { date: string }) {
       let subtotal = 0;
       for (const oi of order.order_items) {
         if (!oi.menu_item) continue;
-        const price = oi.menu_item.price ?? 0;
+        const price = oi.variant ? oi.variant.price : (oi.menu_item.price ?? 0);
         const lineTotal = price * oi.quantity;
         subtotal += lineTotal;
-        items.push({ name: oi.menu_item.name, quantity: oi.quantity, price, lineTotal });
+        const variantLabel = oi.variant?.label ?? null;
+        const displayName = variantLabel
+          ? `${oi.menu_item.name} (${variantLabel})`
+          : oi.menu_item.name;
+        items.push({ name: oi.menu_item.name, variantLabel, quantity: oi.quantity, price, lineTotal });
 
-        const existing = group.itemTotals.get(oi.menu_item.id);
+        const totalKey = oi.variant ? `${oi.menu_item.id}:${oi.variant.id}` : oi.menu_item.id;
+        const existing = group.itemTotals.get(totalKey);
         if (existing) existing.quantity += oi.quantity;
-        else group.itemTotals.set(oi.menu_item.id, { name: oi.menu_item.name, quantity: oi.quantity });
+        else group.itemTotals.set(totalKey, { name: displayName, quantity: oi.quantity });
       }
 
       group.employees.push({
@@ -223,7 +229,10 @@ function RestaurantInvoice({ group }: { group: RestaurantGroup }) {
                 </div>
                 <p className="text-sm text-zinc-600">
                   {emp.items
-                    .map((it) => (it.quantity > 1 ? `${it.name} ×${it.quantity}` : it.name))
+                    .map((it) => {
+                      const label = it.variantLabel ? `${it.name} (${it.variantLabel})` : it.name;
+                      return it.quantity > 1 ? `${label} ×${it.quantity}` : label;
+                    })
                     .join("، ") || "—"}
                 </p>
                 {emp.notes && <p className="text-xs text-zinc-400">({emp.notes})</p>}

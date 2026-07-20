@@ -20,6 +20,16 @@ export type MenuItem = {
   price: number | null;
   is_available: boolean;
   created_at: string;
+  category: string | null;
+};
+
+export type MenuItemVariant = {
+  id: string;
+  menu_item_id: string;
+  label: string;
+  price: number;
+  sort_order: number;
+  created_at: string;
 };
 
 export type DailySelection = {
@@ -43,5 +53,6 @@ export type OrderItem = {
   order_id: string;
   menu_item_id: string;
   quantity: number;
+  variant_id: string | null;
   created_at: string;
 };

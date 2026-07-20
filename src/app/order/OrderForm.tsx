@@ -3,32 +3,49 @@
 import { useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { todayDateString } from "@/lib/date";
-import type { MenuItem } from "@/lib/types";
+import type { MenuItem, MenuItemVariant } from "@/lib/types";
+
+type ItemWithVariants = MenuItem & { variants: MenuItemVariant[] };
+
+type Selection = {
+  menuItemId: string;
+  variantId: string | null;
+  quantity: number;
+};
+
+function selKey(menuItemId: string, variantId: string | null) {
+  return variantId ? `${menuItemId}:${variantId}` : menuItemId;
+}
 
 export default function OrderForm({
   restaurantId,
   menuItems,
 }: {
   restaurantId: string;
-  menuItems: MenuItem[];
+  menuItems: ItemWithVariants[];
 }) {
   const [employeeName, setEmployeeName] = useState("");
-  const [quantities, setQuantities] = useState<Record<string, number>>({});
+  const [selections, setSelections] = useState<Record<string, Selection>>({});
   const [notes, setNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
 
-  function setQuantity(itemId: string, qty: number) {
-    setQuantities((prev) => {
+  function getQty(menuItemId: string, variantId: string | null) {
+    return selections[selKey(menuItemId, variantId)]?.quantity ?? 0;
+  }
+
+  function setQty(menuItemId: string, variantId: string | null, qty: number) {
+    setSelections((prev) => {
+      const key = selKey(menuItemId, variantId);
       const next = { ...prev };
-      if (qty <= 0) delete next[itemId];
-      else next[itemId] = qty;
+      if (qty <= 0) delete next[key];
+      else next[key] = { menuItemId, variantId, quantity: qty };
       return next;
     });
   }
 
-  const selectedCount = Object.values(quantities).reduce((a, b) => a + b, 0);
+  const selectedCount = Object.values(selections).reduce((a, b) => a + b.quantity, 0);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -62,10 +79,11 @@ export default function OrderForm({
       return;
     }
 
-    const orderItems = Object.entries(quantities).map(([menu_item_id, quantity]) => ({
+    const orderItems = Object.values(selections).map((sel) => ({
       order_id: order.id,
-      menu_item_id,
-      quantity,
+      menu_item_id: sel.menuItemId,
+      quantity: sel.quantity,
+      variant_id: sel.variantId,
     }));
 
     const { error: itemsError } = await supabase.from("order_items").insert(orderItems);
@@ -97,6 +115,13 @@ export default function OrderForm({
     );
   }
 
+  const grouped = new Map<string, ItemWithVariants[]>();
+  for (const item of menuItems) {
+    const cat = item.category || "أصناف";
+    if (!grouped.has(cat)) grouped.set(cat, []);
+    grouped.get(cat)!.push(item);
+  }
+
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-4">
       <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200">
@@ -109,47 +134,109 @@ export default function OrderForm({
         />
       </div>
 
-      <ul className="flex flex-col gap-3">
-        {menuItems.map((item) => {
-          const qty = quantities[item.id] ?? 0;
-          return (
-            <li
-              key={item.id}
-              className={`flex items-center justify-between rounded-xl bg-white p-4 ring-1 transition ${
-                qty > 0 ? "ring-orange-400 bg-orange-50" : "ring-zinc-200"
-              }`}
-            >
-              <div>
-                <p className="font-semibold">{item.name}</p>
-                {item.description && (
-                  <p className="text-sm text-zinc-500">{item.description}</p>
-                )}
-                {item.price != null && (
-                  <p className="text-sm text-zinc-500">{item.price} ج.م</p>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setQuantity(item.id, qty - 1)}
-                  disabled={qty === 0}
-                  className="h-8 w-8 rounded-full bg-zinc-100 text-lg font-bold text-zinc-600 disabled:opacity-40"
+      {Array.from(grouped.entries()).map(([cat, catItems]) => (
+        <div key={cat}>
+          <h3 className="mb-2 rounded-lg bg-orange-50 px-3 py-1.5 text-sm font-bold text-orange-800">
+            {cat}
+          </h3>
+          <ul className="flex flex-col gap-3">
+            {catItems.map((item) => {
+              const hasVariants = item.variants.length > 0;
+
+              if (!hasVariants) {
+                const qty = getQty(item.id, null);
+                return (
+                  <li
+                    key={item.id}
+                    className={`flex items-center justify-between rounded-xl bg-white p-4 ring-1 transition ${
+                      qty > 0 ? "ring-orange-400 bg-orange-50" : "ring-zinc-200"
+                    }`}
+                  >
+                    <div>
+                      <p className="font-semibold">{item.name}</p>
+                      {item.description && (
+                        <p className="text-sm text-zinc-500">{item.description}</p>
+                      )}
+                      {item.price != null && (
+                        <p className="text-sm text-zinc-500">{item.price} ج.م</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setQty(item.id, null, qty - 1)}
+                        disabled={qty === 0}
+                        className="h-8 w-8 rounded-full bg-zinc-100 text-lg font-bold text-zinc-600 disabled:opacity-40"
+                      >
+                        −
+                      </button>
+                      <span className="w-5 text-center font-semibold">{qty}</span>
+                      <button
+                        type="button"
+                        onClick={() => setQty(item.id, null, qty + 1)}
+                        className="h-8 w-8 rounded-full bg-orange-500 text-lg font-bold text-white"
+                      >
+                        +
+                      </button>
+                    </div>
+                  </li>
+                );
+              }
+
+              const anySelected = item.variants.some((v) => getQty(item.id, v.id) > 0);
+              return (
+                <li
+                  key={item.id}
+                  className={`rounded-xl bg-white p-4 ring-1 transition ${
+                    anySelected ? "ring-orange-400 bg-orange-50" : "ring-zinc-200"
+                  }`}
                 >
-                  −
-                </button>
-                <span className="w-5 text-center font-semibold">{qty}</span>
-                <button
-                  type="button"
-                  onClick={() => setQuantity(item.id, qty + 1)}
-                  className="h-8 w-8 rounded-full bg-orange-500 text-lg font-bold text-white"
-                >
-                  +
-                </button>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
+                  <p className="mb-2 font-semibold">{item.name}</p>
+                  {item.description && (
+                    <p className="mb-2 text-sm text-zinc-500">{item.description}</p>
+                  )}
+                  <div className="flex flex-col gap-2">
+                    {item.variants.map((v) => {
+                      const qty = getQty(item.id, v.id);
+                      return (
+                        <div
+                          key={v.id}
+                          className={`flex items-center justify-between rounded-lg px-3 py-2 ${
+                            qty > 0 ? "bg-orange-100" : "bg-zinc-50"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">{v.label}</span>
+                            <span className="text-xs text-zinc-500">{v.price} ج.م</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setQty(item.id, v.id, qty - 1)}
+                              disabled={qty === 0}
+                              className="h-7 w-7 rounded-full bg-zinc-200 text-sm font-bold text-zinc-600 disabled:opacity-40"
+                            >
+                              −
+                            </button>
+                            <span className="w-4 text-center text-sm font-semibold">{qty}</span>
+                            <button
+                              type="button"
+                              onClick={() => setQty(item.id, v.id, qty + 1)}
+                              className="h-7 w-7 rounded-full bg-orange-500 text-sm font-bold text-white"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ))}
 
       <div className="rounded-xl bg-white p-4 ring-1 ring-zinc-200">
         <label className="mb-1 block text-xs font-medium text-zinc-500">
