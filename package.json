@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "description": "Figma plugin to export prototype flows as high-quality video",
   "scripts": {
-    "build": "node esbuild.config.mjs",
-    "watch": "node esbuild.config.mjs --watch"
+    "build": "npm run typecheck && node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "@figma/plugin-typings": "^1.104.0",

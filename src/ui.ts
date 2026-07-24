@@ -48,7 +48,6 @@ let framesData: FrameData[] = [];
 let canvasWidth = 0;
 let canvasHeight = 0;
 let exportScale = 4;
-let totalExpected = 0;
 let previewAbort: AbortController | null = null;
 let renderAbort: AbortController | null = null;
 
@@ -66,7 +65,6 @@ window.onmessage = async (event) => {
 
   if (msg.type === "export-start") {
     cleanup();
-    totalExpected = msg.totalFrames;
     canvasWidth = msg.canvasWidth;
     canvasHeight = msg.canvasHeight;
     exportScale = msg.scale;
@@ -76,13 +74,21 @@ window.onmessage = async (event) => {
   }
 
   if (msg.type === "frame-data") {
-    const buf = msg.imageBuffer as ArrayBuffer;
-    const blob = new Blob([new Uint8Array(buf)], { type: "image/png" });
+    const bytes = toUint8Array(msg.imageBytes);
+    if (bytes.length === 0) {
+      showError("فشل استقبال بيانات الصور من فيجما.");
+      return;
+    }
+    const blob = new Blob([new Uint8Array(bytes)], { type: "image/png" });
     const url = URL.createObjectURL(blob);
     blobUrls.push(url);
-    const img = await loadImage(url);
-    loadedImages.push(img);
-    framesData.push(msg.frame);
+    try {
+      const img = await loadImage(url);
+      loadedImages.push(img);
+      framesData.push(msg.frame);
+    } catch {
+      showError(`فشل تحميل صورة الشاشة "${msg.frame.name}".`);
+    }
   }
 
   if (msg.type === "export-complete") {
@@ -95,6 +101,17 @@ function cleanup() {
   blobUrls = [];
   loadedImages = [];
   framesData = [];
+}
+
+// Figma delivers a Uint8Array, but stay tolerant of other serializations.
+function toUint8Array(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (Array.isArray(value)) return new Uint8Array(value);
+  if (value && typeof value === "object") {
+    return new Uint8Array(Object.values(value as Record<string, number>));
+  }
+  return new Uint8Array(0);
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -217,19 +234,20 @@ function drawPush(
 // --- Shared render loop (used by both preview and export) ---
 
 interface RenderTarget {
-  canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   w: number;
   h: number;
   onFrame: () => void;
+  onProgress?: (done: number, total: number) => void;
   signal: AbortSignal;
 }
 
 async function renderLoop(target: RenderTarget): Promise<void> {
-  const { ctx, w, h, onFrame, signal } = target;
+  const { ctx, w, h, onFrame, onProgress, signal } = target;
 
   for (let i = 0; i < loadedImages.length; i++) {
     if (signal.aborted) return;
+    if (onProgress) onProgress(i, loadedImages.length);
 
     const frame = framesData[i];
     const img = loadedImages[i];
@@ -269,7 +287,7 @@ async function renderLoop(target: RenderTarget): Promise<void> {
 }
 
 function nextTick(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 // --- Preview ---
@@ -305,7 +323,6 @@ async function runPreview(): Promise<void> {
   stopBtn.style.display = "block";
 
   const target: RenderTarget = {
-    canvas: previewCanvas,
     ctx,
     w: canvasWidth,
     h: canvasHeight,
@@ -332,8 +349,25 @@ function stopPreview() {
 
 // --- Video export ---
 
+function isRecordingSupported(): boolean {
+  return (
+    typeof MediaRecorder !== "undefined" &&
+    typeof HTMLCanvasElement.prototype.captureStream === "function" &&
+    (MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ||
+      MediaRecorder.isTypeSupported("video/webm;codecs=vp8"))
+  );
+}
+
 async function renderVideo(): Promise<void> {
   if (loadedImages.length === 0) return;
+
+  if (!isRecordingSupported()) {
+    showError(
+      "متصفحك ما بيدعم تسجيل الفيديو (MediaRecorder/WebM).\n" +
+        "استخدم تطبيق فيجما للديسكتوب أو متصفح Chrome."
+    );
+    return;
+  }
 
   if (previewAbort) previewAbort.abort();
   renderAbort = new AbortController();
@@ -381,11 +415,12 @@ async function renderVideo(): Promise<void> {
   recorder.start();
 
   const target: RenderTarget = {
-    canvas,
     ctx,
     w,
     h,
     onFrame: () => { if (track.requestFrame) track.requestFrame(); },
+    onProgress: (done, total) =>
+      updateProgress(`جاري إنشاء الفيديو: ${done + 1}/${total}`, done + 1, total),
     signal: renderAbort.signal,
   };
 

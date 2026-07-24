@@ -169,7 +169,8 @@ function walkVariants(componentSet: ComponentSetNode): FlowStep[] {
   const chain = walkVariantChain(startVariant, variants);
   if (chain.length > 1) return chain;
 
-  variants.sort((a, b) => a.x - b.x || a.y - b.y);
+  // Row-major order, matching how Figma lays out a variant grid
+  variants.sort((a, b) => a.y - b.y || a.x - b.x);
   return variants.map((v) => ({
     node: v,
     transition: null,
@@ -291,10 +292,21 @@ async function exportNodes(orderedFrames: FlowStep[], scale: number, fallbackHol
   for (let i = 0; i < orderedFrames.length; i++) {
     const step = orderedFrames[i];
 
-    const imageData = await step.node.exportAsync({
-      format: "PNG",
-      constraint: { type: "SCALE", value: scale },
-    });
+    let imageData: Uint8Array;
+    try {
+      imageData = await step.node.exportAsync({
+        format: "PNG",
+        constraint: { type: "SCALE", value: scale },
+      });
+    } catch (e) {
+      figma.ui.postMessage({
+        type: "error",
+        message:
+          `فشل تصدير "${step.node.name}" بجودة ${scale}x.\n` +
+          `جرّب جودة أقل (2x أو 1x) — الشاشة كبيرة زيادة على هذه الجودة.`,
+      });
+      return;
+    }
 
     const transitionDuration = step.transition?.duration ?? null;
     const holdDuration = computeHoldDuration(step.triggerDelay, transitionDuration, fallbackHoldMs);
@@ -309,24 +321,22 @@ async function exportNodes(orderedFrames: FlowStep[], scale: number, fallbackHol
         }
       : null;
 
-    figma.ui.postMessage(
-      {
-        type: "frame-data",
-        index: i,
-        total: orderedFrames.length,
-        frame: {
-          id: step.node.id,
-          name: step.node.name,
-          width: step.node.width,
-          height: step.node.height,
-          transition: transitionInfo,
-          holdDuration,
-        },
-        imageBuffer: imageData.buffer,
-        hasAutoTiming,
+    // Figma's postMessage supports Uint8Array but NOT ArrayBuffer.
+    figma.ui.postMessage({
+      type: "frame-data",
+      index: i,
+      total: orderedFrames.length,
+      frame: {
+        id: step.node.id,
+        name: step.node.name,
+        width: step.node.width,
+        height: step.node.height,
+        transition: transitionInfo,
+        holdDuration,
       },
-      [imageData.buffer]
-    );
+      imageBytes: imageData,
+      hasAutoTiming,
+    });
 
     figma.ui.postMessage({
       type: "progress",
