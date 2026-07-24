@@ -112,6 +112,8 @@ async function receiveFrame(msg: {
         key: layer.key,
         rect: layer.rect,
         opacity: layer.opacity,
+        rotation: layer.rotation,
+        hash: layer.hash,
         image: images[layer.imageIndex],
       }));
     }

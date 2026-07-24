@@ -4,6 +4,7 @@ import {
   FrameSpec,
   LayerSpec,
   MAX_ANIMATED_LAYERS,
+  MAX_LAYER_DEPTH,
   PluginSettings,
   Rect,
   SPRING_PRESETS,
@@ -363,55 +364,96 @@ function layerRect(child: SceneNode, origin: { x: number; y: number }): Rect | n
   };
 }
 
-/**
- * Splits a frame into its background plus one image per direct child, so the
- * UI can move children independently the way Smart Animate does.
- *
- * Children are hidden on the real node while the background is exported and
- * restored immediately afterwards — Figma has no API to render a subtree
- * without them.
- */
-async function decomposeFrame(
-  node: FlowNode,
-  scale: number
-): Promise<Decomposition | null> {
-  const children = node.children.filter((c) => c.visible);
-  if (children.length === 0 || children.length > MAX_ANIMATED_LAYERS) return null;
+/** Cheap fingerprint used to tell "moved" apart from "changed". */
+function hashBytes(bytes: Uint8Array): number {
+  let hash = 2166136261;
+  const stride = Math.max(1, Math.floor(bytes.length / 4096));
+  for (let i = 0; i < bytes.length; i += stride) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash ^ bytes.length) >>> 0;
+}
 
-  const origin = frameOrigin(node);
-  const layers: LayerSpec[] = [];
-  const layerImages: Uint8Array[] = [];
+function hasOwnPaint(node: SceneNode): boolean {
+  const n = node as Partial<GeometryMixin & BlendMixin>;
+  const fills = n.fills;
+  if (Array.isArray(fills) && fills.some((f) => f.visible !== false)) return true;
+  const strokes = n.strokes;
+  if (Array.isArray(strokes) && strokes.some((s) => s.visible !== false)) return true;
+  const effects = n.effects;
+  if (Array.isArray(effects) && effects.some((e) => e.visible !== false)) return true;
+  return false;
+}
+
+interface PlannedLayer {
+  node: SceneNode;
+  /** Render the node without its children, so its subtree can animate freely. */
+  ownPaintOnly: boolean;
+  path: string;
+}
+
+/**
+ * Chooses which nodes animate independently. Descending past the top level is
+ * what lets elements nested inside a card or group move on their own, which is
+ * how Smart Animate behaves in Figma.
+ */
+function planLayers(
+  container: SceneNode & ChildrenMixin,
+  prefix: string,
+  depth: number,
+  budget: { left: number }
+): PlannedLayer[] {
+  const planned: PlannedLayer[] = [];
   const nameCounts = new Map<string, number>();
 
-  for (const child of children) {
-    const rect = layerRect(child, origin);
-    if (!rect || rect.w <= 0 || rect.h <= 0) continue;
+  for (const child of container.children) {
+    if (!child.visible || budget.left <= 0) continue;
 
-    const image = await child.exportAsync({
-      format: "PNG",
-      constraint: { type: "SCALE", value: scale },
-    });
-
-    // Layers match across frames by name; disambiguate repeated names by order.
     const seen = nameCounts.get(child.name) || 0;
     nameCounts.set(child.name, seen + 1);
+    const path = `${prefix}/${child.name}#${seen}`;
 
-    layers.push({
-      key: `${child.name}#${seen}`,
-      rect,
-      opacity: "opacity" in child ? (child as BlendMixin & SceneNode).opacity : 1,
-      imageIndex: layerImages.length,
-    });
-    layerImages.push(image);
+    const children = (child as Partial<ChildrenMixin>).children;
+    // Clipping containers would leak their overflow once split apart.
+    const clips = (child as Partial<{ clipsContent: boolean }>).clipsContent === true;
+    const canDescend =
+      depth < MAX_LAYER_DEPTH &&
+      Array.isArray(children) &&
+      children.length > 0 &&
+      children.length <= 20 &&
+      !clips &&
+      budget.left > children.length;
+
+    if (!canDescend) {
+      planned.push({ node: child, ownPaintOnly: false, path });
+      budget.left--;
+      continue;
+    }
+
+    if (hasOwnPaint(child)) {
+      planned.push({ node: child, ownPaintOnly: true, path: `${path}/self` });
+      budget.left--;
+    }
+
+    planned.push(
+      ...planLayers(child as SceneNode & ChildrenMixin, path, depth + 1, budget)
+    );
   }
 
-  if (layers.length === 0) return null;
+  return planned;
+}
 
+/** Exports a node with its children hidden, restoring them afterwards. */
+async function exportWithoutChildren(
+  node: SceneNode & ChildrenMixin,
+  scale: number
+): Promise<Uint8Array> {
+  const children = node.children.filter((c) => c.visible);
   const previous = children.map((c) => c.visible);
-  let baseImage: Uint8Array;
   try {
     for (const child of children) child.visible = false;
-    baseImage = await node.exportAsync({
+    return await node.exportAsync({
       format: "PNG",
       constraint: { type: "SCALE", value: scale },
     });
@@ -420,7 +462,53 @@ async function decomposeFrame(
       child.visible = previous[i];
     });
   }
+}
 
+/**
+ * Splits a frame into its background plus one image per animatable layer, so
+ * the UI can move each piece independently the way Smart Animate does.
+ *
+ * Layers are hidden on the real node while backgrounds are exported and
+ * restored immediately afterwards — Figma has no API to render a subtree
+ * without them.
+ */
+async function decomposeFrame(
+  node: FlowNode,
+  scale: number
+): Promise<Decomposition | null> {
+  const budget = { left: MAX_ANIMATED_LAYERS };
+  const planned = planLayers(node, "", 0, budget);
+  if (planned.length === 0 || budget.left <= 0) return null;
+
+  const origin = frameOrigin(node);
+  const layers: LayerSpec[] = [];
+  const layerImages: Uint8Array[] = [];
+
+  for (const item of planned) {
+    const rect = layerRect(item.node, origin);
+    if (!rect || rect.w <= 0 || rect.h <= 0) continue;
+
+    const image = item.ownPaintOnly
+      ? await exportWithoutChildren(item.node as SceneNode & ChildrenMixin, scale)
+      : await item.node.exportAsync({
+          format: "PNG",
+          constraint: { type: "SCALE", value: scale },
+        });
+
+    layers.push({
+      key: item.path,
+      rect,
+      opacity: "opacity" in item.node ? (item.node as BlendMixin & SceneNode).opacity : 1,
+      rotation: "rotation" in item.node ? (item.node as LayoutMixin).rotation : 0,
+      hash: hashBytes(image),
+      imageIndex: layerImages.length,
+    });
+    layerImages.push(image);
+  }
+
+  if (layers.length === 0) return null;
+
+  const baseImage = await exportWithoutChildren(node, scale);
   return { layers, layerImages, baseImage };
 }
 

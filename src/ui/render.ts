@@ -5,6 +5,8 @@ export interface LoadedLayer {
   key: string;
   rect: Rect; // frame units
   opacity: number;
+  rotation: number; // degrees
+  hash: number;
   image: HTMLImageElement;
 }
 
@@ -155,11 +157,20 @@ function drawSmartAnimate(
     matchedKeys.add(layer.key);
     const rect = lerpRect(layer.rect, match.rect, t);
     const opacity = lerp(layer.opacity, match.opacity, t);
+    const spin = shortestRotation(layer.rotation, match.rotation);
+
+    // Identical artwork means the layer only moved, so cross-fading it would
+    // just add a ghost — carry the single bitmap across instead.
+    if (layer.hash === match.hash) {
+      ctx.globalAlpha = opacity;
+      drawLayer(ctx, layer.image, rect, offsetX, offsetY, scale, spin * t);
+      continue;
+    }
 
     ctx.globalAlpha = opacity * (1 - t);
-    drawLayer(ctx, layer.image, rect, offsetX, offsetY, scale);
+    drawLayer(ctx, layer.image, rect, offsetX, offsetY, scale, spin * t);
     ctx.globalAlpha = opacity * t;
-    drawLayer(ctx, match.image, rect, offsetX, offsetY, scale);
+    drawLayer(ctx, match.image, rect, offsetX, offsetY, scale, -spin * (1 - t));
   }
 
   for (const layer of toLayers) {
@@ -172,21 +183,40 @@ function drawSmartAnimate(
   ctx.globalAlpha = 1;
 }
 
+/** Signed shortest angular distance, so a layer never spins the long way. */
+function shortestRotation(from: number, to: number): number {
+  let delta = (to - from) % 360;
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+  return delta;
+}
+
 function drawLayer(
   ctx: CanvasRenderingContext2D,
   image: HTMLImageElement,
   rect: Rect,
   offsetX: number,
   offsetY: number,
-  scale: number
+  scale: number,
+  rotation = 0
 ): void {
-  ctx.drawImage(
-    image,
-    offsetX + rect.x * scale,
-    offsetY + rect.y * scale,
-    rect.w * scale,
-    rect.h * scale
-  );
+  const x = offsetX + rect.x * scale;
+  const y = offsetY + rect.y * scale;
+  const w = rect.w * scale;
+  const h = rect.h * scale;
+
+  // The exported bitmap already bakes in the layer's own rotation, so only the
+  // difference between the two frames is applied here.
+  if (Math.abs(rotation) < 0.01) {
+    ctx.drawImage(image, x, y, w, h);
+    return;
+  }
+
+  ctx.save();
+  ctx.translate(x + w / 2, y + h / 2);
+  ctx.rotate((-rotation * Math.PI) / 180);
+  ctx.drawImage(image, -w / 2, -h / 2, w, h);
+  ctx.restore();
 }
 
 /** Motion along `direction`, expressed as a unit vector in frame units. */
@@ -310,9 +340,8 @@ function planSteps(scene: Scene, fps: number): Step[] {
 
     let transitionFrames = 0;
     if (next && transition) {
-      // Spring curves run for as long as they need; Figma ignores the slider.
-      const seconds = curve?.naturalDuration ?? transition.duration;
-      transitionFrames = Math.max(Math.round(seconds * fps), 1);
+      // Figma's duration is authoritative for every easing, springs included.
+      transitionFrames = Math.max(Math.round(transition.duration * fps), 1);
     }
 
     steps.push({

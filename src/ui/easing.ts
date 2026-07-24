@@ -132,35 +132,32 @@ function springSolver(
 export interface EasingCurve {
   /** Progress 0..1 for a normalised time 0..1. May overshoot past 1. */
   at: (t: number) => number;
-  /** Natural duration in seconds for springs, or null to use Figma's value. */
-  naturalDuration: number | null;
 }
 
+/**
+ * Figma pairs every easing — springs included — with an explicit duration in
+ * the interaction panel, so a spring contributes its *shape* (including any
+ * overshoot) compressed into that duration, not its own settling time.
+ */
 export function buildEasing(easing: EasingSpec | undefined): EasingCurve {
   if (!easing) {
     const [x1, y1, x2, y2] = NAMED_BEZIERS.EASE_IN_AND_OUT;
-    return { at: cubicBezier(x1, y1, x2, y2), naturalDuration: null };
+    return { at: cubicBezier(x1, y1, x2, y2) };
   }
 
   if (easing.spring) {
     const solver = springSolver(easing.spring);
     if (solver) {
-      return {
-        at: (t: number) => solver.at(t * solver.settleTime),
-        naturalDuration: solver.settleTime,
-      };
+      return { at: (t: number) => solver.at(t * solver.settleTime) };
     }
     // Unstable parameters — fall through to a standard curve.
   }
 
   if (easing.type === "CUSTOM_CUBIC_BEZIER" && easing.bezier) {
     const b = easing.bezier;
-    return { at: cubicBezier(b.x1, b.y1, b.x2, b.y2), naturalDuration: null };
+    return { at: cubicBezier(b.x1, b.y1, b.x2, b.y2) };
   }
 
   const named = NAMED_BEZIERS[easing.type] || NAMED_BEZIERS.EASE_IN_AND_OUT;
-  return {
-    at: cubicBezier(named[0], named[1], named[2], named[3]),
-    naturalDuration: null,
-  };
+  return { at: cubicBezier(named[0], named[1], named[2], named[3]) };
 }

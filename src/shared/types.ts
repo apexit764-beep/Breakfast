@@ -36,11 +36,15 @@ export interface Rect {
   h: number;
 }
 
-/** A direct child of a frame, used to drive smart-animate interpolation. */
+/** One animatable piece of a frame, used to drive smart-animate. */
 export interface LayerSpec {
-  key: string; // match key (layer name)
+  /** Match key: the layer's name path, disambiguated for repeated names. */
+  key: string;
   rect: Rect; // relative to the frame's bounding box, in frame units
   opacity: number;
+  rotation: number; // degrees
+  /** Cheap fingerprint of the rendered bytes, to detect unchanged content. */
+  hash: number;
   imageIndex: number; // index into the frame's layerImages array
 }
 
@@ -118,4 +122,6 @@ export const SPRING_PRESETS: Record<string, SpringParams> = {
   SLOW: { mass: 1, stiffness: 80, damping: 20, initialVelocity: 0 },
 };
 
-export const MAX_ANIMATED_LAYERS = 40;
+export const MAX_ANIMATED_LAYERS = 60;
+/** How far to descend when splitting a frame into animatable pieces. */
+export const MAX_LAYER_DEPTH = 3;
