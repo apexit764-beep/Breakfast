@@ -29,8 +29,16 @@ function el<T extends HTMLElement>(id: string): T {
   return node as T;
 }
 
-function show(id: string, visible: boolean): void {
-  el(id).style.display = visible ? "" : "none";
+/**
+ * Sections default to `display: none` in the stylesheet, so showing them needs
+ * an explicit value — clearing the inline style just falls back to hidden.
+ */
+function show(id: string, visible: boolean, display = "block"): void {
+  el(id).style.display = visible ? display : "none";
+}
+
+function isVisible(id: string): boolean {
+  return getComputedStyle(el(id)).display !== "none";
 }
 
 // --- Messaging -----------------------------------------------------------
@@ -245,13 +253,29 @@ async function runPreview(): Promise<void> {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
 
+  // Pace against the wall clock so the preview runs at the video's real speed
+  // rather than the display's refresh rate.
+  const frameInterval = 1000 / settings.fps;
+  let deadline = performance.now();
+  const emit = () => {
+    deadline += frameInterval;
+    const wait = deadline - performance.now();
+    if (wait > 1) {
+      return new Promise<void>((r) => setTimeout(r, wait));
+    }
+    // Running behind: yield without sleeping so we catch up.
+    deadline = Math.max(deadline, performance.now());
+    return new Promise<void>((r) => requestAnimationFrame(() => r()));
+  };
+
   do {
+    deadline = performance.now();
     await renderSequence({
       scene,
       ctx,
       scale: previewScale,
       fps: settings.fps,
-      emit: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
+      emit,
       signal,
     });
   } while (previewLoop && !signal.aborted);
@@ -297,7 +321,7 @@ async function exportVideo(): Promise<void> {
 
   try {
     const sink = await createSink(settings.format, {
-      canvas,
+      source: canvas,
       width,
       height,
       fps,
@@ -439,9 +463,8 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   el("toggle-list").addEventListener("click", () => {
-    const list = el("screen-list");
-    const open = list.style.display !== "none";
-    list.style.display = open ? "none" : "block";
+    const open = isVisible("screen-list");
+    show("screen-list", !open);
     el("toggle-list").textContent = open ? "عرض الشاشات ▾" : "إخفاء الشاشات ▴";
   });
 

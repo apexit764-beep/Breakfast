@@ -51,6 +51,15 @@ npm run watch     # rebuild on change
 npm run typecheck
 ```
 
+To exercise the UI half without Figma — it feeds stand-in plugin messages to
+`dist/ui.html` in a headless browser and checks that the screen list, preview,
+and export all come up:
+
+```bash
+npm i --no-save playwright
+node scripts/ui-smoke-test.mjs
+```
+
 Load it in Figma:
 - Figma → Plugins → Development → Import plugin from manifest
 - Select `manifest.json`
