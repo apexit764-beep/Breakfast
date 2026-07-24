@@ -104,10 +104,11 @@ function extractReactionData(node: SceneNode): ReactionData {
 
     const trigger = reaction.trigger as any;
     let triggerDelay: number | null = null;
-    if (trigger) {
-      // Figma reports trigger timeout/delay in milliseconds.
-      if (typeof trigger.timeout === "number") triggerDelay = trigger.timeout;
-      else if (typeof trigger.delay === "number") triggerDelay = trigger.delay;
+    if (trigger && trigger.type === "AFTER_TIMEOUT") {
+      if (typeof trigger.timeout === "number" && Number.isFinite(trigger.timeout))
+        triggerDelay = trigger.timeout;
+      else if (typeof trigger.delay === "number" && Number.isFinite(trigger.delay))
+        triggerDelay = trigger.delay;
     }
 
     const overlay = action.overlayRelativePosition;
@@ -313,7 +314,19 @@ function walkVariants(componentSet: ComponentSetNode): Flow {
   const byId = new Map(variants.map((v) => [v.id, v]));
   const start = findStartVariant(variants);
   const flow = walkFlow(start, (id) => byId.get(id) || null);
-  if (flow.steps.length > 1) return flow;
+
+  if (flow.steps.length > 1) {
+    if (flow.steps.length < variants.length) {
+      const included = new Set(flow.steps.map((s) => s.node.id));
+      const missing = variants
+        .filter((v) => !included.has(v.id))
+        .sort((a, b) => a.y - b.y || a.x - b.x);
+      for (const v of missing) {
+        flow.steps.push({ node: v, reaction: extractReactionData(v) });
+      }
+    }
+    return flow;
+  }
 
   // No interaction chain: fall back to the variant grid order (row-major).
   const ordered = variants.slice().sort((a, b) => a.y - b.y || a.x - b.x);
@@ -519,7 +532,7 @@ function computeHold(
   transition: TransitionSpec | null,
   fallbackMs: number
 ): number {
-  if (triggerDelay != null) return triggerDelay;
+  if (triggerDelay != null && triggerDelay > 0) return triggerDelay;
   if (transition && transition.duration > 0) {
     return Math.max(transition.duration * 1000, fallbackMs);
   }
