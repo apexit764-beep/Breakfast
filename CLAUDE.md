@@ -19,3 +19,11 @@ trigger timeouts in **milliseconds**.
 
 figma.ui.postMessage supports Uint8Array but not ArrayBuffer, and takes no
 transfer list — send image bytes as Uint8Array.
+
+The sandbox posts every `frame-data` and then `export-complete` back to back,
+while the UI decodes each PNG asynchronously. `export-complete` therefore
+arrives with every decode still in flight, so the UI keeps its decode promises
+in `decodeJobs` and awaits them before building the scene — and stores frames at
+the sender's index, because decodes finish out of order. Any test that pauses
+between the last frame and `export-complete` hides this; scripts/frame-race-test.mjs
+sends them with no gap the way Figma does.

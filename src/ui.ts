@@ -15,7 +15,11 @@ import {
 let scene: Scene | null = null;
 let exportScale = 4;
 let blobUrls: string[] = [];
-let pending: LoadedFrame[] = [];
+/** Indexed by the sender's frame index, so order never depends on decode speed. */
+let pending: (LoadedFrame | null)[] = [];
+/** One entry per in-flight frame decode; finishScene waits on all of them. */
+let decodeJobs: Promise<void>[] = [];
+let droppedFrames: string[] = [];
 let previewAbort: AbortController | null = null;
 let renderAbort: AbortController | null = null;
 let previewLoop = false;
@@ -67,11 +71,11 @@ window.onmessage = async (event: MessageEvent) => {
       break;
 
     case "frame-data":
-      await receiveFrame(msg);
+      receiveFrame(msg);
       break;
 
     case "export-complete":
-      finishScene(msg.hasAutoTiming, msg.warnings || []);
+      await finishScene(msg.hasAutoTiming, msg.warnings || []);
       break;
   }
 };
@@ -84,6 +88,8 @@ function resetScene(msg: {
 }): void {
   releaseUrls();
   pending = [];
+  decodeJobs = [];
+  droppedFrames = [];
   exportScale = msg.scale;
   scene = {
     frames: [],
@@ -95,43 +101,83 @@ function resetScene(msg: {
   show("preview-section", false);
 }
 
-async function receiveFrame(msg: {
+/**
+ * Decoding is async but the sandbox sends every frame — then export-complete —
+ * without pausing, so the work is registered here and awaited in finishScene.
+ * Frames land at their sender-assigned index so slow decodes can't reorder them.
+ */
+function receiveFrame(msg: {
+  index?: number;
   frame: FrameSpec;
   imageBytes: unknown;
   layerImages: unknown[];
-}): Promise<void> {
-  try {
-    const image = await decodeImage(msg.imageBytes);
+}): void {
+  const index = typeof msg.index === "number" ? msg.index : decodeJobs.length;
 
-    let layers: LoadedLayer[] | null = null;
-    if (msg.frame.layers) {
-      const images = await Promise.all(
-        (msg.layerImages || []).map((bytes) => decodeImage(bytes))
-      );
-      layers = msg.frame.layers.map((layer) => ({
-        key: layer.key,
-        rect: layer.rect,
-        opacity: layer.opacity,
-        rotation: layer.rotation,
-        hash: layer.hash,
-        image: images[layer.imageIndex],
-      }));
-    }
+  decodeJobs.push(
+    (async () => {
+      let layers: LoadedLayer[] | null = null;
 
-    pending.push({ spec: msg.frame, image, layers });
-  } catch (e) {
-    showStatus(`فشل تحميل صورة الشاشة "${msg.frame.name}".`, "error");
-  }
+      if (msg.frame.layers) {
+        const images = await Promise.all(
+          (msg.layerImages || []).map((bytes) => decodeImageOrNull(bytes))
+        );
+        // One unrenderable layer must not cost us the whole screen.
+        const loaded: LoadedLayer[] = [];
+        for (const layer of msg.frame.layers) {
+          const image = images[layer.imageIndex];
+          if (!image) continue;
+          loaded.push({
+            key: layer.key,
+            rect: layer.rect,
+            opacity: layer.opacity,
+            rotation: layer.rotation,
+            hash: layer.hash,
+            image,
+          });
+        }
+        layers = loaded.length > 0 ? loaded : null;
+      }
+
+      let image = await decodeImageOrNull(msg.imageBytes);
+      if (!image && layers) {
+        // A frame whose background rendered empty can still show its layers.
+        image = await transparentImage();
+      }
+      if (!image) {
+        droppedFrames.push(msg.frame.name);
+        return;
+      }
+
+      pending[index] = { spec: msg.frame, image, layers };
+    })()
+  );
 }
 
-function finishScene(hasAutoTiming: boolean, warnings: string[]): void {
-  if (!scene || pending.length === 0) {
+async function finishScene(
+  hasAutoTiming: boolean,
+  warnings: string[]
+): Promise<void> {
+  // Every frame is still decoding at this point; none of them are usable yet.
+  await Promise.all(decodeJobs);
+  decodeJobs = [];
+
+  const frames = pending.filter((f): f is LoadedFrame => f != null);
+  pending = [];
+
+  if (!scene || frames.length === 0) {
     showStatus("ما وصلت أي شاشات صالحة.", "error");
+    setBusy(false);
     return;
   }
 
-  scene.frames = pending;
-  pending = [];
+  if (droppedFrames.length > 0) {
+    warnings = warnings.concat(
+      `تعذّر تحميل ${droppedFrames.length} شاشة: ${droppedFrames.join("، ")}`
+    );
+  }
+
+  scene.frames = frames;
 
   const fps = settings.fps;
   const totalFrames = countOutputFrames(scene, fps);
@@ -224,6 +270,30 @@ function decodeImage(value: unknown): Promise<HTMLImageElement> {
     img.onerror = () => reject(new Error("decode failed"));
     img.src = url;
   });
+}
+
+/** Decode that reports failure as null instead of rejecting. */
+function decodeImageOrNull(value: unknown): Promise<HTMLImageElement | null> {
+  return decodeImage(value).then(
+    (img) => img,
+    () => null
+  );
+}
+
+let transparentPixel: Promise<HTMLImageElement> | null = null;
+
+/** 1x1 transparent PNG, used as a stand-in background behind live layers. */
+function transparentImage(): Promise<HTMLImageElement> {
+  if (!transparentPixel) {
+    transparentPixel = new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("placeholder failed"));
+      img.src =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    });
+  }
+  return transparentPixel;
 }
 
 function releaseUrls(): void {
