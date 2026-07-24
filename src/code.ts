@@ -15,6 +15,8 @@ interface TransitionInfo {
   easing: string;
 }
 
+type ExportableNode = FrameNode | ComponentNode | ComponentSetNode;
+
 figma.showUI(__html__, { width: 480, height: 640, themeColors: true });
 
 figma.ui.onmessage = async (msg) => {
@@ -29,13 +31,26 @@ figma.ui.onmessage = async (msg) => {
 
 async function exportPrototypeFlow(scale: number, holdMs: number) {
   const page = figma.currentPage;
+  const selection = figma.currentPage.selection;
 
+  // Check if user selected a component set or a variant component
+  const variantFlow = findVariantFlow(selection, page);
+
+  if (variantFlow && variantFlow.length > 0) {
+    await exportNodes(variantFlow, scale, holdMs);
+    return;
+  }
+
+  // Fallback to top-level frame flow
   const startingFrame = findStartingFrame(page);
   if (!startingFrame) {
     figma.ui.postMessage({
       type: "error",
       message:
-        "لم يتم العثور على أي Prototype Flow. تأكد من وجود اتصالات بروتوتايب في الصفحة الحالية.",
+        "لم يتم العثور على أي بروتوتايب.\n\n" +
+        "جرّب:\n" +
+        "• اختر الـ Component Set (اللي فيه الـ variants) ثم شغّل البلاجن\n" +
+        "• أو تأكد من وجود اتصالات بروتوتايب بين الشاشات",
     });
     return;
   }
@@ -49,6 +64,186 @@ async function exportPrototypeFlow(scale: number, holdMs: number) {
     return;
   }
 
+  await exportNodes(orderedFrames, scale, holdMs);
+}
+
+interface FlowStep {
+  node: FrameNode | ComponentNode;
+  transition: Transition | null;
+}
+
+function findVariantFlow(
+  selection: ReadonlyArray<SceneNode>,
+  page: PageNode
+): FlowStep[] | null {
+  // Try from selection first
+  if (selection.length > 0) {
+    const sel = selection[0];
+
+    // Selected a ComponentSet directly
+    if (sel.type === "COMPONENT_SET") {
+      return walkVariants(sel);
+    }
+
+    // Selected a Component that's inside a ComponentSet
+    if (sel.type === "COMPONENT" && sel.parent?.type === "COMPONENT_SET") {
+      return walkVariants(sel.parent as ComponentSetNode);
+    }
+
+    // Selected an instance — find its main component's set
+    if (sel.type === "INSTANCE") {
+      const main = sel.mainComponent;
+      if (main && main.parent?.type === "COMPONENT_SET") {
+        return walkVariants(main.parent as ComponentSetNode);
+      }
+    }
+  }
+
+  // Auto-detect: search page for ComponentSets with variant interactions
+  for (const child of page.children) {
+    if (child.type === "COMPONENT_SET") {
+      const flow = walkVariants(child);
+      if (flow.length > 1) return flow;
+    }
+  }
+
+  // Deep search: look inside frames for component sets
+  for (const child of page.children) {
+    if (child.type === "FRAME") {
+      const sets = findComponentSets(child);
+      for (const set of sets) {
+        const flow = walkVariants(set);
+        if (flow.length > 1) return flow;
+      }
+    }
+  }
+
+  return null;
+}
+
+function findComponentSets(node: SceneNode): ComponentSetNode[] {
+  const results: ComponentSetNode[] = [];
+  if (node.type === "COMPONENT_SET") {
+    results.push(node);
+  }
+  if ("children" in node) {
+    for (const child of (node as any).children) {
+      results.push(...findComponentSets(child));
+    }
+  }
+  return results;
+}
+
+function walkVariants(componentSet: ComponentSetNode): FlowStep[] {
+  const variants = componentSet.children.filter(
+    (c): c is ComponentNode => c.type === "COMPONENT"
+  );
+
+  if (variants.length === 0) return [];
+
+  // Try to find a variant chain via reactions (SWAP interactions)
+  const startVariant = findStartVariant(variants);
+  const chain = walkVariantChain(startVariant, variants);
+
+  if (chain.length > 1) return chain;
+
+  // No interaction chain found — export all variants in order (left to right, top to bottom)
+  variants.sort((a, b) => a.x - b.x || a.y - b.y);
+  return variants.map((v, i) => ({
+    node: v,
+    transition: i === 0 ? null : { type: "DISSOLVE", duration: 0.3, easing: { type: "EASE_IN_AND_OUT" } } as any,
+  }));
+}
+
+function findStartVariant(variants: ComponentNode[]): ComponentNode {
+  const targetIds = new Set<string>();
+
+  for (const v of variants) {
+    const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
+    if (!reactions) continue;
+    for (const r of reactions) {
+      if (r.action?.type === "NODE" && r.action.destinationId) {
+        targetIds.add(r.action.destinationId);
+      }
+    }
+  }
+
+  // Start variant = one that no other variant points to
+  for (const v of variants) {
+    if (!targetIds.has(v.id)) {
+      const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
+      if (reactions && reactions.length > 0) return v;
+    }
+  }
+
+  // Fallback: first variant with reactions
+  for (const v of variants) {
+    const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
+    if (reactions && reactions.length > 0) return v;
+  }
+
+  return variants[0];
+}
+
+function walkVariantChain(
+  start: ComponentNode,
+  allVariants: ComponentNode[]
+): FlowStep[] {
+  const visited = new Set<string>();
+  const result: FlowStep[] = [];
+  let current: ComponentNode | null = start;
+  let currentTransition: Transition | null = null;
+
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    result.push({ node: current, transition: currentTransition });
+
+    const next = getNextVariant(current, allVariants);
+    if (next) {
+      current = next.targetNode;
+      currentTransition = next.transition;
+    } else {
+      current = null;
+      currentTransition = null;
+    }
+  }
+
+  return result;
+}
+
+function getNextVariant(
+  node: ComponentNode,
+  allVariants: ComponentNode[]
+): { targetNode: ComponentNode; transition: Transition } | null {
+  const reactions = (node as any).reactions as ReadonlyArray<Reaction> | undefined;
+  if (!reactions) return null;
+
+  const variantIds = new Set(allVariants.map((v) => v.id));
+
+  for (const reaction of reactions) {
+    const action = reaction.action;
+    if (!action) continue;
+
+    if (action.type === "NODE" && action.destinationId) {
+      // Check if target is a sibling variant
+      if (variantIds.has(action.destinationId)) {
+        const target = allVariants.find((v) => v.id === action.destinationId)!;
+        return {
+          targetNode: target,
+          transition: action.transition || null,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function exportNodes(
+  orderedFrames: FlowStep[],
+  scale: number,
+  holdMs: number
+) {
   figma.ui.postMessage({
     type: "progress",
     message: `جاري تصدير ${orderedFrames.length} شاشات بجودة ${scale}x...`,
@@ -130,11 +325,6 @@ function findStartingFrame(
   }
 
   return topFrames[0] || null;
-}
-
-interface FlowStep {
-  node: FrameNode | ComponentNode;
-  transition: Transition | null;
 }
 
 function walkPrototypeFlow(
