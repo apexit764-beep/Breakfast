@@ -82,15 +82,24 @@ function extractReactionData(
     let triggerDelay: number | null = null;
     const trigger = reaction.trigger;
     if (trigger) {
-      if (trigger.type === "AFTER_TIMEOUT" && (trigger as any).timeout != null) {
-        triggerDelay = (trigger as any).timeout;
-      } else if (trigger.type === "AFTER_TIMEOUT" && (trigger as any).delay != null) {
-        triggerDelay = (trigger as any).delay;
+      const t = trigger as any;
+      // Read delay from any trigger type that has timing
+      if (t.timeout != null) {
+        triggerDelay = t.timeout;
+      } else if (t.delay != null) {
+        triggerDelay = t.delay;
       }
     }
 
+    const transition = action.transition || null;
+
+    // If no explicit trigger delay, derive hold time from transition duration
+    if (triggerDelay == null && transition && transition.duration > 0) {
+      triggerDelay = transition.duration * 1000;
+    }
+
     return {
-      transition: action.transition || null,
+      transition,
       triggerDelay,
       destinationId: action.destinationId,
     };
