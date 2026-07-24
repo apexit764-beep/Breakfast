@@ -1,0 +1,14 @@
+{
+  "name": "figma-prototype-to-video",
+  "version": "1.0.0",
+  "description": "Figma plugin to export prototype flows as high-quality video",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.104.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
