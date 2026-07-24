@@ -3,7 +3,6 @@ interface FrameData {
   name: string;
   width: number;
   height: number;
-  imageData: number[];
   transition: {
     type: string;
     direction: string;
@@ -13,17 +12,7 @@ interface FrameData {
   holdDuration: number;
 }
 
-interface FramesReadyMsg {
-  type: "frames-ready";
-  frames: FrameData[];
-  canvasWidth: number;
-  canvasHeight: number;
-  scale: number;
-  hasAutoTiming: boolean;
-}
-
 const FPS = 60;
-const FRAME_INTERVAL = 1000 / FPS;
 
 const EASING_FUNCTIONS: Record<string, (t: number) => number> = {
   linear: (t) => t,
@@ -54,10 +43,14 @@ function getEasing(name: string): (t: number) => number {
 }
 
 let loadedImages: HTMLImageElement[] = [];
+let blobUrls: string[] = [];
 let framesData: FrameData[] = [];
 let canvasWidth = 0;
 let canvasHeight = 0;
 let exportScale = 4;
+let totalExpected = 0;
+let previewAbort: AbortController | null = null;
+let renderAbort: AbortController | null = null;
 
 window.onmessage = async (event) => {
   const msg = event.data.pluginMessage;
@@ -71,27 +64,37 @@ window.onmessage = async (event) => {
     showError(msg.message);
   }
 
-  if (msg.type === "frames-ready") {
-    const data = msg as FramesReadyMsg;
-    canvasWidth = data.canvasWidth;
-    canvasHeight = data.canvasHeight;
-    exportScale = data.scale;
-    framesData = data.frames;
-    await loadImages(data.frames);
-    showRenderReady(data.hasAutoTiming);
+  if (msg.type === "export-start") {
+    cleanup();
+    totalExpected = msg.totalFrames;
+    canvasWidth = msg.canvasWidth;
+    canvasHeight = msg.canvasHeight;
+    exportScale = msg.scale;
+    framesData = [];
+    loadedImages = [];
+    blobUrls = [];
+  }
+
+  if (msg.type === "frame-data") {
+    const buf = msg.imageBuffer as ArrayBuffer;
+    const blob = new Blob([new Uint8Array(buf)], { type: "image/png" });
+    const url = URL.createObjectURL(blob);
+    blobUrls.push(url);
+    const img = await loadImage(url);
+    loadedImages.push(img);
+    framesData.push(msg.frame);
+  }
+
+  if (msg.type === "export-complete") {
+    showRenderReady(msg.hasAutoTiming);
   }
 };
 
-async function loadImages(frames: FrameData[]): Promise<void> {
+function cleanup() {
+  for (const url of blobUrls) URL.revokeObjectURL(url);
+  blobUrls = [];
   loadedImages = [];
-  for (const frame of frames) {
-    const blob = new Blob([new Uint8Array(frame.imageData)], {
-      type: "image/png",
-    });
-    const url = URL.createObjectURL(blob);
-    const img = await loadImage(url);
-    loadedImages.push(img);
-  }
+  framesData = [];
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -103,16 +106,243 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// --- Drawing transitions ---
+
+function drawTransition(
+  ctx: CanvasRenderingContext2D,
+  fromImg: HTMLImageElement,
+  toImg: HTMLImageElement,
+  type: string,
+  direction: string,
+  t: number,
+  w: number,
+  h: number
+): void {
+  switch (type) {
+    case "DISSOLVE":
+    case "SMART_ANIMATE":
+      ctx.globalAlpha = 1;
+      ctx.drawImage(fromImg, 0, 0, w, h);
+      ctx.globalAlpha = t;
+      ctx.drawImage(toImg, 0, 0, w, h);
+      ctx.globalAlpha = 1;
+      break;
+
+    case "MOVE_IN":
+      ctx.drawImage(fromImg, 0, 0, w, h);
+      drawSlideIn(ctx, toImg, direction, t, w, h);
+      break;
+
+    case "MOVE_OUT":
+      ctx.drawImage(toImg, 0, 0, w, h);
+      drawSlideOut(ctx, fromImg, direction, t, w, h);
+      break;
+
+    case "PUSH":
+      drawPush(ctx, fromImg, toImg, direction, t, w, h);
+      break;
+
+    case "SLIDE_IN":
+      ctx.drawImage(fromImg, 0, 0, w, h);
+      drawSlideIn(ctx, toImg, direction, t, w, h);
+      break;
+
+    case "SLIDE_OUT":
+      ctx.drawImage(toImg, 0, 0, w, h);
+      drawSlideOut(ctx, fromImg, direction, t, w, h);
+      break;
+
+    default:
+      ctx.globalAlpha = 1 - t;
+      ctx.drawImage(fromImg, 0, 0, w, h);
+      ctx.globalAlpha = t;
+      ctx.drawImage(toImg, 0, 0, w, h);
+      ctx.globalAlpha = 1;
+      break;
+  }
 }
+
+function drawSlideIn(
+  ctx: CanvasRenderingContext2D, img: HTMLImageElement,
+  dir: string, t: number, w: number, h: number
+): void {
+  let x = 0, y = 0;
+  switch (dir) {
+    case "LEFT": x = w * (1 - t); break;
+    case "RIGHT": x = -w * (1 - t); break;
+    case "TOP": y = h * (1 - t); break;
+    case "BOTTOM": y = -h * (1 - t); break;
+  }
+  ctx.drawImage(img, x, y, w, h);
+}
+
+function drawSlideOut(
+  ctx: CanvasRenderingContext2D, img: HTMLImageElement,
+  dir: string, t: number, w: number, h: number
+): void {
+  let x = 0, y = 0;
+  switch (dir) {
+    case "LEFT": x = -w * t; break;
+    case "RIGHT": x = w * t; break;
+    case "TOP": y = -h * t; break;
+    case "BOTTOM": y = h * t; break;
+  }
+  ctx.drawImage(img, x, y, w, h);
+}
+
+function drawPush(
+  ctx: CanvasRenderingContext2D, fromImg: HTMLImageElement,
+  toImg: HTMLImageElement, dir: string, t: number, w: number, h: number
+): void {
+  switch (dir) {
+    case "LEFT":
+      ctx.drawImage(fromImg, -w * t, 0, w, h);
+      ctx.drawImage(toImg, w * (1 - t), 0, w, h);
+      break;
+    case "RIGHT":
+      ctx.drawImage(fromImg, w * t, 0, w, h);
+      ctx.drawImage(toImg, -w * (1 - t), 0, w, h);
+      break;
+    case "TOP":
+      ctx.drawImage(fromImg, 0, -h * t, w, h);
+      ctx.drawImage(toImg, 0, h * (1 - t), w, h);
+      break;
+    case "BOTTOM":
+      ctx.drawImage(fromImg, 0, h * t, w, h);
+      ctx.drawImage(toImg, 0, -h * (1 - t), w, h);
+      break;
+  }
+}
+
+// --- Shared render loop (used by both preview and export) ---
+
+interface RenderTarget {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  w: number;
+  h: number;
+  onFrame: () => void;
+  signal: AbortSignal;
+}
+
+async function renderLoop(target: RenderTarget): Promise<void> {
+  const { ctx, w, h, onFrame, signal } = target;
+
+  for (let i = 0; i < loadedImages.length; i++) {
+    if (signal.aborted) return;
+
+    const frame = framesData[i];
+    const img = loadedImages[i];
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    onFrame();
+
+    // Hold
+    const holdFrameCount = Math.max(Math.round((frame.holdDuration / 1000) * FPS), 1);
+    for (let f = 1; f < holdFrameCount; f++) {
+      if (signal.aborted) return;
+      onFrame();
+      await nextTick();
+    }
+
+    // Transition to next
+    if (i < loadedImages.length - 1) {
+      const nextImg = loadedImages[i + 1];
+      const trans = frame.transition;
+
+      if (trans && trans.duration > 0) {
+        const totalTransFrames = Math.max(Math.round(trans.duration * FPS), 1);
+        const easingFn = getEasing(trans.easing);
+
+        for (let f = 0; f <= totalTransFrames; f++) {
+          if (signal.aborted) return;
+          const t = easingFn(f / totalTransFrames);
+          ctx.clearRect(0, 0, w, h);
+          drawTransition(ctx, img, nextImg, trans.type, trans.direction, t, w, h);
+          onFrame();
+          await nextTick();
+        }
+      }
+    }
+  }
+}
+
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+// --- Preview ---
+
+async function runPreview(): Promise<void> {
+  if (loadedImages.length === 0) return;
+
+  if (previewAbort) previewAbort.abort();
+  previewAbort = new AbortController();
+
+  const previewSection = document.getElementById("preview-section")!;
+  const previewCanvas = document.getElementById("preview-canvas") as HTMLCanvasElement;
+  const previewBtn = document.getElementById("preview-btn") as HTMLButtonElement;
+  const stopBtn = document.getElementById("stop-preview-btn") as HTMLButtonElement;
+
+  previewSection.style.display = "block";
+
+  const maxW = 440;
+  const aspect = canvasHeight / canvasWidth;
+  const displayW = Math.min(maxW, canvasWidth);
+  const displayH = Math.round(displayW * aspect);
+
+  previewCanvas.width = canvasWidth;
+  previewCanvas.height = canvasHeight;
+  previewCanvas.style.width = displayW + "px";
+  previewCanvas.style.height = displayH + "px";
+
+  const ctx = previewCanvas.getContext("2d", { alpha: false })!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  previewBtn.style.display = "none";
+  stopBtn.style.display = "block";
+
+  const target: RenderTarget = {
+    canvas: previewCanvas,
+    ctx,
+    w: canvasWidth,
+    h: canvasHeight,
+    onFrame: () => {},
+    signal: previewAbort.signal,
+  };
+
+  await renderLoop(target);
+
+  stopBtn.style.display = "none";
+  previewBtn.style.display = "block";
+}
+
+function stopPreview() {
+  if (previewAbort) {
+    previewAbort.abort();
+    previewAbort = null;
+  }
+  const stopBtn = document.getElementById("stop-preview-btn") as HTMLButtonElement;
+  const previewBtn = document.getElementById("preview-btn") as HTMLButtonElement;
+  stopBtn.style.display = "none";
+  previewBtn.style.display = "block";
+}
+
+// --- Video export ---
 
 async function renderVideo(): Promise<void> {
   if (loadedImages.length === 0) return;
 
+  if (previewAbort) previewAbort.abort();
+  renderAbort = new AbortController();
+
   const renderBtn = document.getElementById("render-btn") as HTMLButtonElement;
+  const cancelRenderBtn = document.getElementById("cancel-render-btn") as HTMLButtonElement;
   renderBtn.disabled = true;
   renderBtn.textContent = "جاري إنشاء الفيديو...";
+  cancelRenderBtn.style.display = "block";
 
   const w = canvasWidth * exportScale;
   const h = canvasHeight * exportScale;
@@ -145,61 +375,32 @@ async function renderVideo(): Promise<void> {
   };
 
   const videoReady = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => {
-      resolve(new Blob(chunks, { type: "video/webm" }));
-    };
+    recorder.onstop = () => resolve(new Blob(chunks, { type: "video/webm" }));
   });
 
   recorder.start();
 
-  for (let i = 0; i < loadedImages.length; i++) {
-    const frame = framesData[i];
-    const img = loadedImages[i];
+  const target: RenderTarget = {
+    canvas,
+    ctx,
+    w,
+    h,
+    onFrame: () => { if (track.requestFrame) track.requestFrame(); },
+    signal: renderAbort.signal,
+  };
 
-    // Draw the current frame
-    ctx.clearRect(0, 0, w, h);
-    ctx.drawImage(img, 0, 0, w, h);
-
-    // Hold: emit frames for the hold duration
-    const holdFrameCount = Math.round((frame.holdDuration / 1000) * FPS);
-    for (let f = 0; f < holdFrameCount; f++) {
-      if (track.requestFrame) track.requestFrame();
-      await sleep(FRAME_INTERVAL);
-    }
-
-    // Transition to next frame
-    if (i < loadedImages.length - 1) {
-      const nextImg = loadedImages[i + 1];
-      const trans = frame.transition;
-
-      if (trans && trans.duration > 0) {
-        const totalTransFrames = Math.max(
-          Math.round(trans.duration * FPS),
-          1
-        );
-        const easingFn = getEasing(trans.easing);
-
-        for (let f = 0; f <= totalTransFrames; f++) {
-          const rawT = f / totalTransFrames;
-          const t = easingFn(rawT);
-
-          ctx.clearRect(0, 0, w, h);
-          drawTransition(ctx, img, nextImg, trans.type, trans.direction, t, w, h);
-
-          if (track.requestFrame) track.requestFrame();
-          await sleep(FRAME_INTERVAL);
-        }
-      }
-    }
-
-    updateProgress(
-      `جاري إنشاء الفيديو: ${i + 1}/${loadedImages.length}`,
-      i + 1,
-      loadedImages.length
-    );
-  }
+  await renderLoop(target);
 
   recorder.stop();
+
+  if (renderAbort.signal.aborted) {
+    cancelRenderBtn.style.display = "none";
+    renderBtn.disabled = false;
+    renderBtn.textContent = "تصدير فيديو";
+    showError("تم إلغاء التصدير");
+    return;
+  }
+
   const videoBlob = await videoReady;
 
   const url = URL.createObjectURL(videoBlob);
@@ -207,134 +408,25 @@ async function renderVideo(): Promise<void> {
   a.href = url;
   a.download = "prototype-export.webm";
   a.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 
   const sizeMB = (videoBlob.size / (1024 * 1024)).toFixed(1);
 
+  cancelRenderBtn.style.display = "none";
   renderBtn.disabled = false;
   renderBtn.textContent = "تصدير فيديو";
 
   showSuccess(`تم تصدير الفيديو بنجاح (${sizeMB} MB)`);
 }
 
-function drawTransition(
-  ctx: CanvasRenderingContext2D,
-  fromImg: HTMLImageElement,
-  toImg: HTMLImageElement,
-  type: string,
-  direction: string,
-  t: number,
-  w: number,
-  h: number
-): void {
-  switch (type) {
-    case "DISSOLVE":
-    case "SMART_ANIMATE":
-      ctx.globalAlpha = 1;
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      ctx.globalAlpha = t;
-      ctx.drawImage(toImg, 0, 0, w, h);
-      ctx.globalAlpha = 1;
-      break;
-
-    case "MOVE_IN":
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      drawSlideIn(ctx, toImg, direction, t, w, h);
-      break;
-
-    case "MOVE_OUT":
-      drawSlideOut(ctx, fromImg, direction, t, w, h);
-      ctx.drawImage(toImg, 0, 0, w, h);
-      break;
-
-    case "PUSH":
-      drawPush(ctx, fromImg, toImg, direction, t, w, h);
-      break;
-
-    case "SLIDE_IN":
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      drawSlideIn(ctx, toImg, direction, t, w, h);
-      break;
-
-    case "SLIDE_OUT":
-      ctx.drawImage(toImg, 0, 0, w, h);
-      drawSlideOut(ctx, fromImg, direction, 1 - t, w, h);
-      break;
-
-    default:
-      ctx.globalAlpha = 1 - t;
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      ctx.globalAlpha = t;
-      ctx.drawImage(toImg, 0, 0, w, h);
-      ctx.globalAlpha = 1;
-      break;
+function cancelRender() {
+  if (renderAbort) {
+    renderAbort.abort();
+    renderAbort = null;
   }
 }
 
-function drawSlideIn(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
-  dir: string,
-  t: number,
-  w: number,
-  h: number
-): void {
-  let x = 0, y = 0;
-  switch (dir) {
-    case "LEFT": x = w * (1 - t); break;
-    case "RIGHT": x = -w * (1 - t); break;
-    case "TOP": y = h * (1 - t); break;
-    case "BOTTOM": y = -h * (1 - t); break;
-  }
-  ctx.drawImage(img, x, y, w, h);
-}
-
-function drawSlideOut(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
-  dir: string,
-  t: number,
-  w: number,
-  h: number
-): void {
-  let x = 0, y = 0;
-  switch (dir) {
-    case "LEFT": x = -w * t; break;
-    case "RIGHT": x = w * t; break;
-    case "TOP": y = -h * t; break;
-    case "BOTTOM": y = h * t; break;
-  }
-  ctx.drawImage(img, x, y, w, h);
-}
-
-function drawPush(
-  ctx: CanvasRenderingContext2D,
-  fromImg: HTMLImageElement,
-  toImg: HTMLImageElement,
-  dir: string,
-  t: number,
-  w: number,
-  h: number
-): void {
-  switch (dir) {
-    case "LEFT":
-      ctx.drawImage(fromImg, -w * t, 0, w, h);
-      ctx.drawImage(toImg, w * (1 - t), 0, w, h);
-      break;
-    case "RIGHT":
-      ctx.drawImage(fromImg, w * t, 0, w, h);
-      ctx.drawImage(toImg, -w * (1 - t), 0, w, h);
-      break;
-    case "TOP":
-      ctx.drawImage(fromImg, 0, -h * t, w, h);
-      ctx.drawImage(toImg, 0, h * (1 - t), w, h);
-      break;
-    case "BOTTOM":
-      ctx.drawImage(fromImg, 0, h * t, w, h);
-      ctx.drawImage(toImg, 0, -h * (1 - t), w, h);
-      break;
-  }
-}
+// --- UI helpers ---
 
 function updateProgress(message: string, current: number, total: number): void {
   const el = document.getElementById("progress-area")!;
@@ -360,44 +452,34 @@ function showSuccess(message: string): void {
 }
 
 function showRenderReady(hasAutoTiming: boolean): void {
-  const el = document.getElementById("render-section")!;
-  el.style.display = "block";
+  const renderSection = document.getElementById("render-section")!;
+  renderSection.style.display = "block";
+
   const info = document.getElementById("frame-info")!;
-
-  let timingNote = "";
-  if (hasAutoTiming) {
-    timingNote = " — التوقيت من إعدادات البروتوتايب ✓";
-  } else {
-    timingNote = " — يستخدم المدة الاحتياطية";
-  }
-
-  info.textContent = `${loadedImages.length} شاشات — ${canvasWidth}×${canvasHeight} @ ${exportScale}x${timingNote}`;
+  const timingBadge = hasAutoTiming ? "التوقيت من البروتوتايب" : "توقيت احتياطي";
+  info.textContent = `${loadedImages.length} شاشات — ${canvasWidth}×${canvasHeight} @ ${exportScale}x — ${timingBadge}`;
 
   const progressArea = document.getElementById("progress-area")!;
   progressArea.style.display = "none";
+
+  const status = document.getElementById("status")!;
+  status.style.display = "none";
 }
 
+// --- Init ---
+
 document.addEventListener("DOMContentLoaded", () => {
-  const exportBtn = document.getElementById("export-btn")!;
-  exportBtn.addEventListener("click", () => {
-    const scaleSelect = document.getElementById("scale") as HTMLSelectElement;
-    const holdInput = document.getElementById("hold-duration") as HTMLInputElement;
-    const scale = parseInt(scaleSelect.value);
-    const fallbackHoldMs = parseInt(holdInput.value);
-
-    parent.postMessage(
-      { pluginMessage: { type: "start-export", scale, fallbackHoldMs } },
-      "*"
-    );
+  document.getElementById("export-btn")!.addEventListener("click", () => {
+    const scale = parseInt((document.getElementById("scale") as HTMLSelectElement).value);
+    const fallbackHoldMs = parseInt((document.getElementById("hold-duration") as HTMLInputElement).value);
+    parent.postMessage({ pluginMessage: { type: "start-export", scale, fallbackHoldMs } }, "*");
   });
 
-  const renderBtn = document.getElementById("render-btn")!;
-  renderBtn.addEventListener("click", () => {
-    renderVideo();
-  });
-
-  const cancelBtn = document.getElementById("cancel-btn")!;
-  cancelBtn.addEventListener("click", () => {
+  document.getElementById("preview-btn")!.addEventListener("click", () => runPreview());
+  document.getElementById("stop-preview-btn")!.addEventListener("click", () => stopPreview());
+  document.getElementById("render-btn")!.addEventListener("click", () => renderVideo());
+  document.getElementById("cancel-render-btn")!.addEventListener("click", () => cancelRender());
+  document.getElementById("cancel-btn")!.addEventListener("click", () => {
     parent.postMessage({ pluginMessage: { type: "cancel" } }, "*");
   });
 });
