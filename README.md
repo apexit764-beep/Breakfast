@@ -1,41 +1,21 @@
-# فطور اليوم — لوحة تحكم طلبات الفطور
+# Figma Prototype to Video Exporter
 
-تطبيق Next.js (Static Export) لإدارة طلبات الفطور اليومية للموظفين:
+A Figma plugin that exports prototype flows as video files.
 
-- **لوحة تحكم الأدمن** (`/admin`, محمية بكلمة سر): إضافة/تعديل/حذف المطاعم ومنيو كل مطعم، اختيار مطاعم اليوم، ومتابعة طلبات الموظفين مجمعة حسب المطعم والصنف.
-- **صفحة الموظفين** (`/`): تعرض مطاعم اليوم المختارة من الأدمن، وعند اختيار مطعم يفتح منيوه ليسجل الموظف طلبه.
+## How it works
 
-## الإعداد
+1. Select a prototype flow in your Figma file
+2. The plugin reads all frames and transition settings (duration, easing, animation type)
+3. Each frame is exported as an image
+4. Frames are composited into a video with animated transitions using Canvas + MediaRecorder API
 
-1. انسخ `.env.local.example` إلى `.env.local` وعبّي القيم:
-   - `NEXT_PUBLIC_SUPABASE_URL` و `NEXT_PUBLIC_SUPABASE_ANON_KEY` من مشروع Supabase.
-   - `NEXT_PUBLIC_ADMIN_PASSWORD` كلمة سر الدخول للوحة التحكم.
-2. ثبّت الحزم:
+## Development
 
 ```bash
 npm install
-```
-
-3. شغّل السيرفر محلياً:
-
-```bash
-npm run dev
-```
-
-افتح [http://localhost:3000](http://localhost:3000) لصفحة الموظفين، و [http://localhost:3000/admin](http://localhost:3000/admin) للوحة التحكم.
-
-## قاعدة البيانات
-
-قاعدة البيانات على Supabase (Postgres) وتحتوي الجداول: `restaurants`, `menu_items`, `daily_selections`, `orders`, `order_items`. الصلاحيات على الجداول مفتوحة عبر RLS policies بسيطة (public read + write) لأن حماية لوحة الأدمن تتم عبر كلمة السر على مستوى المتصفح فقط.
-
-## البناء والنشر (Static Export)
-
-المشروع مبني كـ `output: "export"` — أي بدون سيرفر Node.js، فقط ملفات HTML/CSS/JS ثابتة يمكن استضافتها على أي استضافة ثابتة (nginx، Vercel، أي CDN).
-
-```bash
 npm run build
 ```
 
-الناتج بيكون في مجلد `out/` — ارفع محتوياته كما هي لجذر الاستضافة.
-
-**ملاحظة أمنية:** بما إن الموقع ثابت بالكامل، كلمة سر الأدمن (`NEXT_PUBLIC_ADMIN_PASSWORD`) مدمجة داخل كود الـ JavaScript المُحمّل للمتصفح، وحماية `/admin` تتم بالكامل من طرف العميل (client-side) عبر `localStorage`. هاي حماية بسيطة مناسبة لأداة داخلية، لكنها مش بديل عن مصادقة حقيقية على مستوى السيرفر — لا تستخدمها لبيانات حساسة.
+Then load the plugin in Figma:
+- Figma → Plugins → Development → Import plugin from manifest
+- Select the `manifest.json` file
