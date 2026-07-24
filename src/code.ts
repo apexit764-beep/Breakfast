@@ -15,13 +15,11 @@ interface TransitionInfo {
   easing: string;
 }
 
-type ExportableNode = FrameNode | ComponentNode | ComponentSetNode;
-
-figma.showUI(__html__, { width: 480, height: 640, themeColors: true });
+figma.showUI(__html__, { width: 480, height: 580, themeColors: true });
 
 figma.ui.onmessage = async (msg) => {
   if (msg.type === "start-export") {
-    await exportPrototypeFlow(msg.scale || 4, msg.holdMs || 1000);
+    await exportPrototypeFlow(msg.scale || 4, msg.fallbackHoldMs || 1000);
   }
 
   if (msg.type === "cancel") {
@@ -29,19 +27,17 @@ figma.ui.onmessage = async (msg) => {
   }
 };
 
-async function exportPrototypeFlow(scale: number, holdMs: number) {
+async function exportPrototypeFlow(scale: number, fallbackHoldMs: number) {
   const page = figma.currentPage;
   const selection = figma.currentPage.selection;
 
-  // Check if user selected a component set or a variant component
   const variantFlow = findVariantFlow(selection, page);
 
   if (variantFlow && variantFlow.length > 0) {
-    await exportNodes(variantFlow, scale, holdMs);
+    await exportNodes(variantFlow, scale, fallbackHoldMs);
     return;
   }
 
-  // Fallback to top-level frame flow
   const startingFrame = findStartingFrame(page);
   if (!startingFrame) {
     figma.ui.postMessage({
@@ -64,33 +60,60 @@ async function exportPrototypeFlow(scale: number, holdMs: number) {
     return;
   }
 
-  await exportNodes(orderedFrames, scale, holdMs);
+  await exportNodes(orderedFrames, scale, fallbackHoldMs);
 }
 
 interface FlowStep {
   node: FrameNode | ComponentNode;
   transition: Transition | null;
+  triggerDelay: number | null;
+}
+
+function extractReactionData(
+  node: SceneNode
+): { transition: Transition | null; triggerDelay: number | null; destinationId: string | null } {
+  const reactions = (node as any).reactions as ReadonlyArray<Reaction> | undefined;
+  if (!reactions) return { transition: null, triggerDelay: null, destinationId: null };
+
+  for (const reaction of reactions) {
+    const action = reaction.action;
+    if (!action || action.type !== "NODE" || !action.destinationId) continue;
+
+    let triggerDelay: number | null = null;
+    const trigger = reaction.trigger;
+    if (trigger) {
+      if (trigger.type === "AFTER_TIMEOUT" && (trigger as any).timeout != null) {
+        triggerDelay = (trigger as any).timeout;
+      } else if (trigger.type === "AFTER_TIMEOUT" && (trigger as any).delay != null) {
+        triggerDelay = (trigger as any).delay;
+      }
+    }
+
+    return {
+      transition: action.transition || null,
+      triggerDelay,
+      destinationId: action.destinationId,
+    };
+  }
+
+  return { transition: null, triggerDelay: null, destinationId: null };
 }
 
 function findVariantFlow(
   selection: ReadonlyArray<SceneNode>,
   page: PageNode
 ): FlowStep[] | null {
-  // Try from selection first
   if (selection.length > 0) {
     const sel = selection[0];
 
-    // Selected a ComponentSet directly
     if (sel.type === "COMPONENT_SET") {
       return walkVariants(sel);
     }
 
-    // Selected a Component that's inside a ComponentSet
     if (sel.type === "COMPONENT" && sel.parent?.type === "COMPONENT_SET") {
       return walkVariants(sel.parent as ComponentSetNode);
     }
 
-    // Selected an instance — find its main component's set
     if (sel.type === "INSTANCE") {
       const main = sel.mainComponent;
       if (main && main.parent?.type === "COMPONENT_SET") {
@@ -99,7 +122,6 @@ function findVariantFlow(
     }
   }
 
-  // Auto-detect: search page for ComponentSets with variant interactions
   for (const child of page.children) {
     if (child.type === "COMPONENT_SET") {
       const flow = walkVariants(child);
@@ -107,7 +129,6 @@ function findVariantFlow(
     }
   }
 
-  // Deep search: look inside frames for component sets
   for (const child of page.children) {
     if (child.type === "FRAME") {
       const sets = findComponentSets(child);
@@ -141,17 +162,16 @@ function walkVariants(componentSet: ComponentSetNode): FlowStep[] {
 
   if (variants.length === 0) return [];
 
-  // Try to find a variant chain via reactions (SWAP interactions)
   const startVariant = findStartVariant(variants);
   const chain = walkVariantChain(startVariant, variants);
 
   if (chain.length > 1) return chain;
 
-  // No interaction chain found — export all variants in order (left to right, top to bottom)
   variants.sort((a, b) => a.x - b.x || a.y - b.y);
-  return variants.map((v, i) => ({
+  return variants.map((v) => ({
     node: v,
-    transition: i === 0 ? null : { type: "DISSOLVE", duration: 0.3, easing: { type: "EASE_IN_AND_OUT" } } as any,
+    transition: null,
+    triggerDelay: null,
   }));
 }
 
@@ -159,16 +179,10 @@ function findStartVariant(variants: ComponentNode[]): ComponentNode {
   const targetIds = new Set<string>();
 
   for (const v of variants) {
-    const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
-    if (!reactions) continue;
-    for (const r of reactions) {
-      if (r.action?.type === "NODE" && r.action.destinationId) {
-        targetIds.add(r.action.destinationId);
-      }
-    }
+    const { destinationId } = extractReactionData(v);
+    if (destinationId) targetIds.add(destinationId);
   }
 
-  // Start variant = one that no other variant points to
   for (const v of variants) {
     if (!targetIds.has(v.id)) {
       const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
@@ -176,7 +190,6 @@ function findStartVariant(variants: ComponentNode[]): ComponentNode {
     }
   }
 
-  // Fallback: first variant with reactions
   for (const v of variants) {
     const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
     if (reactions && reactions.length > 0) return v;
@@ -191,58 +204,34 @@ function walkVariantChain(
 ): FlowStep[] {
   const visited = new Set<string>();
   const result: FlowStep[] = [];
+  const variantIds = new Set(allVariants.map((v) => v.id));
   let current: ComponentNode | null = start;
-  let currentTransition: Transition | null = null;
 
   while (current && !visited.has(current.id)) {
     visited.add(current.id);
-    result.push({ node: current, transition: currentTransition });
 
-    const next = getNextVariant(current, allVariants);
-    if (next) {
-      current = next.targetNode;
-      currentTransition = next.transition;
+    const { transition, triggerDelay, destinationId } = extractReactionData(current);
+
+    result.push({
+      node: current,
+      transition,
+      triggerDelay,
+    });
+
+    if (destinationId && variantIds.has(destinationId)) {
+      current = allVariants.find((v) => v.id === destinationId) || null;
     } else {
       current = null;
-      currentTransition = null;
     }
   }
 
   return result;
 }
 
-function getNextVariant(
-  node: ComponentNode,
-  allVariants: ComponentNode[]
-): { targetNode: ComponentNode; transition: Transition } | null {
-  const reactions = (node as any).reactions as ReadonlyArray<Reaction> | undefined;
-  if (!reactions) return null;
-
-  const variantIds = new Set(allVariants.map((v) => v.id));
-
-  for (const reaction of reactions) {
-    const action = reaction.action;
-    if (!action) continue;
-
-    if (action.type === "NODE" && action.destinationId) {
-      // Check if target is a sibling variant
-      if (variantIds.has(action.destinationId)) {
-        const target = allVariants.find((v) => v.id === action.destinationId)!;
-        return {
-          targetNode: target,
-          transition: action.transition || null,
-        };
-      }
-    }
-  }
-
-  return null;
-}
-
 async function exportNodes(
   orderedFrames: FlowStep[],
   scale: number,
-  holdMs: number
+  fallbackHoldMs: number
 ) {
   figma.ui.postMessage({
     type: "progress",
@@ -252,35 +241,39 @@ async function exportNodes(
   });
 
   const frames: FrameExport[] = [];
+  let hasAutoTiming = false;
 
   for (let i = 0; i < orderedFrames.length; i++) {
-    const { node, transition } = orderedFrames[i];
+    const step = orderedFrames[i];
 
-    const imageData = await node.exportAsync({
+    const imageData = await step.node.exportAsync({
       format: "PNG",
       constraint: { type: "SCALE", value: scale },
     });
 
+    const holdDuration = step.triggerDelay != null ? step.triggerDelay : fallbackHoldMs;
+    if (step.triggerDelay != null) hasAutoTiming = true;
+
     frames.push({
-      id: node.id,
-      name: node.name,
-      width: node.width,
-      height: node.height,
+      id: step.node.id,
+      name: step.node.name,
+      width: step.node.width,
+      height: step.node.height,
       imageData,
-      transition: transition
+      transition: step.transition
         ? {
-            type: transition.type || "DISSOLVE",
-            direction: (transition as any).direction || "LEFT",
-            duration: transition.duration || 0.3,
-            easing: getEasingName(transition.easing),
+            type: step.transition.type || "DISSOLVE",
+            direction: (step.transition as any).direction || "LEFT",
+            duration: step.transition.duration || 0.3,
+            easing: getEasingName(step.transition.easing),
           }
         : null,
-      holdDuration: holdMs,
+      holdDuration,
     });
 
     figma.ui.postMessage({
       type: "progress",
-      message: `تم تصدير: ${node.name}`,
+      message: `تم تصدير: ${step.node.name}`,
       total: orderedFrames.length,
       current: i + 1,
     });
@@ -296,6 +289,7 @@ async function exportNodes(
     canvasWidth: firstNode.width,
     canvasHeight: firstNode.height,
     scale,
+    hasAutoTiming,
   });
 }
 
@@ -333,19 +327,23 @@ function walkPrototypeFlow(
   const visited = new Set<string>();
   const result: FlowStep[] = [];
   let current: FrameNode | ComponentNode | null = startNode;
-  let currentTransition: Transition | null = null;
 
   while (current && !visited.has(current.id)) {
     visited.add(current.id);
-    result.push({ node: current, transition: currentTransition });
 
-    const next = getNextFrame(current);
-    if (next) {
-      current = next.targetNode;
-      currentTransition = next.transition;
+    const { transition, triggerDelay, destinationId } = extractReactionData(current);
+
+    result.push({ node: current, transition, triggerDelay });
+
+    if (destinationId) {
+      const target = figma.getNodeById(destinationId);
+      if (target && (target.type === "FRAME" || target.type === "COMPONENT")) {
+        current = target;
+      } else {
+        current = null;
+      }
     } else {
       current = null;
-      currentTransition = null;
     }
   }
 
@@ -362,41 +360,12 @@ function walkPrototypeFlow(
     for (const frame of topFrames) {
       if (!visited.has(frame.id)) {
         visited.add(frame.id);
-        result.push({ node: frame, transition: null });
+        result.push({ node: frame, transition: null, triggerDelay: null });
       }
     }
   }
 
   return result;
-}
-
-function getNextFrame(
-  node: FrameNode | ComponentNode
-): { targetNode: FrameNode | ComponentNode; transition: Transition } | null {
-  const reactions = (node as any).reactions as
-    | ReadonlyArray<Reaction>
-    | undefined;
-  if (!reactions) return null;
-
-  for (const reaction of reactions) {
-    const action = reaction.action;
-    if (!action) continue;
-
-    if (action.type === "NODE" && action.destinationId) {
-      const target = figma.getNodeById(action.destinationId);
-      if (
-        target &&
-        (target.type === "FRAME" || target.type === "COMPONENT")
-      ) {
-        return {
-          targetNode: target,
-          transition: action.transition || null,
-        };
-      }
-    }
-  }
-
-  return null;
 }
 
 function getEasingName(easing: Easing): string {

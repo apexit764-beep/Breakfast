@@ -19,9 +19,11 @@ interface FramesReadyMsg {
   canvasWidth: number;
   canvasHeight: number;
   scale: number;
+  hasAutoTiming: boolean;
 }
 
 const FPS = 60;
+const FRAME_INTERVAL = 1000 / FPS;
 
 const EASING_FUNCTIONS: Record<string, (t: number) => number> = {
   linear: (t) => t,
@@ -76,7 +78,7 @@ window.onmessage = async (event) => {
     exportScale = data.scale;
     framesData = data.frames;
     await loadImages(data.frames);
-    showRenderReady();
+    showRenderReady(data.hasAutoTiming);
   }
 };
 
@@ -101,6 +103,10 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function renderVideo(): Promise<void> {
   if (loadedImages.length === 0) return;
 
@@ -114,7 +120,9 @@ async function renderVideo(): Promise<void> {
   const canvas = document.createElement("canvas");
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext("2d")!;
+  const ctx = canvas.getContext("2d", { alpha: false })!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
 
   const bitrateSelect = document.getElementById("bitrate") as HTMLSelectElement;
   const bitrate = parseInt(bitrateSelect.value);
@@ -148,26 +156,25 @@ async function renderVideo(): Promise<void> {
     const frame = framesData[i];
     const img = loadedImages[i];
 
-    const holdMs = frame.holdDuration;
-    const holdFrames = Math.round((holdMs / 1000) * FPS);
-
+    // Draw the current frame
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
 
-    for (let f = 0; f < holdFrames; f++) {
+    // Hold: emit frames for the hold duration
+    const holdFrameCount = Math.round((frame.holdDuration / 1000) * FPS);
+    for (let f = 0; f < holdFrameCount; f++) {
       if (track.requestFrame) track.requestFrame();
-      await waitFrame();
+      await sleep(FRAME_INTERVAL);
     }
 
+    // Transition to next frame
     if (i < loadedImages.length - 1) {
       const nextImg = loadedImages[i + 1];
-      const nextFrame = framesData[i + 1];
-      const trans = nextFrame.transition;
+      const trans = frame.transition;
 
-      if (trans) {
-        const durationMs = trans.duration * 1000;
+      if (trans && trans.duration > 0) {
         const totalTransFrames = Math.max(
-          Math.round((durationMs / 1000) * FPS),
+          Math.round(trans.duration * FPS),
           1
         );
         const easingFn = getEasing(trans.easing);
@@ -180,7 +187,7 @@ async function renderVideo(): Promise<void> {
           drawTransition(ctx, img, nextImg, trans.type, trans.direction, t, w, h);
 
           if (track.requestFrame) track.requestFrame();
-          await waitFrame();
+          await sleep(FRAME_INTERVAL);
         }
       }
     }
@@ -329,10 +336,6 @@ function drawPush(
   }
 }
 
-function waitFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
-}
-
 function updateProgress(message: string, current: number, total: number): void {
   const el = document.getElementById("progress-area")!;
   const bar = document.getElementById("progress-bar")!;
@@ -356,11 +359,19 @@ function showSuccess(message: string): void {
   el.style.display = "block";
 }
 
-function showRenderReady(): void {
+function showRenderReady(hasAutoTiming: boolean): void {
   const el = document.getElementById("render-section")!;
   el.style.display = "block";
   const info = document.getElementById("frame-info")!;
-  info.textContent = `${loadedImages.length} شاشات — ${canvasWidth}×${canvasHeight} @ ${exportScale}x`;
+
+  let timingNote = "";
+  if (hasAutoTiming) {
+    timingNote = " — التوقيت من إعدادات البروتوتايب ✓";
+  } else {
+    timingNote = " — يستخدم المدة الاحتياطية";
+  }
+
+  info.textContent = `${loadedImages.length} شاشات — ${canvasWidth}×${canvasHeight} @ ${exportScale}x${timingNote}`;
 
   const progressArea = document.getElementById("progress-area")!;
   progressArea.style.display = "none";
@@ -372,10 +383,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const scaleSelect = document.getElementById("scale") as HTMLSelectElement;
     const holdInput = document.getElementById("hold-duration") as HTMLInputElement;
     const scale = parseInt(scaleSelect.value);
-    const holdMs = parseInt(holdInput.value);
+    const fallbackHoldMs = parseInt(holdInput.value);
 
     parent.postMessage(
-      { pluginMessage: { type: "start-export", scale, holdMs } },
+      { pluginMessage: { type: "start-export", scale, fallbackHoldMs } },
       "*"
     );
   });
