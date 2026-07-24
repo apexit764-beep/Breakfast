@@ -1,227 +1,235 @@
-interface FrameExport {
-  id: string;
-  name: string;
-  width: number;
-  height: number;
-  imageData: Uint8Array;
-  transition: TransitionInfo | null;
-  holdDuration: number;
-}
+import {
+  DEFAULT_SETTINGS,
+  EasingSpec,
+  FrameSpec,
+  LayerSpec,
+  MAX_ANIMATED_LAYERS,
+  PluginSettings,
+  Rect,
+  SPRING_PRESETS,
+  TransitionSpec,
+} from "./shared/types";
 
-interface TransitionInfo {
-  type: string;
-  direction: string;
-  duration: number;
-  easing: string;
-}
+type FlowNode = FrameNode | ComponentNode;
 
-figma.showUI(__html__, { width: 480, height: 640, themeColors: true });
+const SETTINGS_KEY = "prototype-to-video-settings";
+
+// Guard against exports large enough to exhaust the UI iframe's memory.
+const MAX_PIXELS_PER_IMAGE = 80_000_000;
+const MAX_PIXELS_TOTAL = 400_000_000;
+
+figma.showUI(__html__, { width: 500, height: 720, themeColors: true });
 
 figma.ui.onmessage = async (msg) => {
-  if (msg.type === "start-export") {
-    await exportPrototypeFlow(msg.scale || 4, msg.fallbackHoldMs || 1000);
+  if (msg.type === "ui-ready") {
+    const stored = await figma.clientStorage.getAsync(SETTINGS_KEY);
+    figma.ui.postMessage({
+      type: "settings",
+      settings: { ...DEFAULT_SETTINGS, ...(stored || {}) } as PluginSettings,
+    });
   }
+
+  if (msg.type === "start-export") {
+    await figma.clientStorage.setAsync(SETTINGS_KEY, msg.settings);
+    try {
+      await exportPrototypeFlow(msg.settings as PluginSettings);
+    } catch (e) {
+      figma.ui.postMessage({
+        type: "error",
+        message: `صار خطأ غير متوقع أثناء القراءة:\n${errorText(e)}`,
+      });
+    }
+  }
+
   if (msg.type === "cancel") {
     figma.closePlugin();
   }
 };
 
-async function exportPrototypeFlow(scale: number, fallbackHoldMs: number) {
-  const page = figma.currentPage;
-  const selection = page.selection;
-
-  const variantFlow = findVariantFlow(selection, page);
-  if (variantFlow && variantFlow.length > 0) {
-    await exportNodes(variantFlow, scale, fallbackHoldMs);
-    return;
-  }
-
-  const startingFrame = findStartingFrame(page);
-  if (!startingFrame) {
-    figma.ui.postMessage({
-      type: "error",
-      message:
-        "لم يتم العثور على أي بروتوتايب.\n\n" +
-        "جرّب:\n" +
-        "• اختر الـ Component Set (اللي فيه الـ variants) ثم شغّل البلاجن\n" +
-        "• أو تأكد من وجود اتصالات بروتوتايب بين الشاشات",
-    });
-    return;
-  }
-
-  const orderedFrames = walkPrototypeFlow(startingFrame);
-  if (orderedFrames.length === 0) {
-    figma.ui.postMessage({
-      type: "error",
-      message: "لم يتم العثور على أي frames في البروتوتايب.",
-    });
-    return;
-  }
-
-  await exportNodes(orderedFrames, scale, fallbackHoldMs);
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
-interface FlowStep {
-  node: FrameNode | ComponentNode;
-  transition: Transition | null;
-  triggerDelay: number | null;
-}
+// --- Reaction extraction -------------------------------------------------
 
 interface ReactionData {
-  transition: Transition | null;
-  triggerDelay: number | null;
+  transition: TransitionSpec | null;
+  triggerDelay: number | null; // ms
   destinationId: string | null;
+  navigation: string;
+  overlayPosition: { x: number; y: number } | null;
+}
+
+const EMPTY_REACTION: ReactionData = {
+  transition: null,
+  triggerDelay: null,
+  destinationId: null,
+  navigation: "NAVIGATE",
+  overlayPosition: null,
+};
+
+/**
+ * Picks the reaction that best represents "what happens next" in a passive
+ * playback: a timed auto-advance wins over anything the user has to do.
+ */
+function triggerPriority(trigger: Trigger | null): number {
+  if (!trigger) return 0;
+  switch (trigger.type) {
+    case "AFTER_TIMEOUT": return 3;
+    case "ON_CLICK":
+    case "ON_PRESS":
+    case "MOUSE_UP":
+    case "MOUSE_DOWN": return 2;
+    case "ON_HOVER":
+    case "MOUSE_ENTER":
+    case "MOUSE_LEAVE": return 1;
+    default: return 1;
+  }
 }
 
 function extractReactionData(node: SceneNode): ReactionData {
   const reactions = (node as any).reactions as ReadonlyArray<Reaction> | undefined;
-  if (!reactions) return { transition: null, triggerDelay: null, destinationId: null };
+  if (!reactions || reactions.length === 0) return EMPTY_REACTION;
+
+  let best: ReactionData | null = null;
+  let bestScore = -1;
 
   for (const reaction of reactions) {
     const action = reaction.action;
     if (!action || action.type !== "NODE" || !action.destinationId) continue;
 
+    const score = triggerPriority(reaction.trigger);
+    if (score <= bestScore) continue;
+
+    const trigger = reaction.trigger as any;
     let triggerDelay: number | null = null;
-    const trigger = reaction.trigger;
     if (trigger) {
-      const t = trigger as any;
-      if (t.timeout != null) triggerDelay = t.timeout;
-      else if (t.delay != null) triggerDelay = t.delay;
+      // Figma reports trigger timeout/delay in milliseconds.
+      if (typeof trigger.timeout === "number") triggerDelay = trigger.timeout;
+      else if (typeof trigger.delay === "number") triggerDelay = trigger.delay;
     }
 
-    return {
-      transition: action.transition || null,
+    const overlay = action.overlayRelativePosition;
+
+    bestScore = score;
+    best = {
+      transition: toTransitionSpec(action.transition),
       triggerDelay,
       destinationId: action.destinationId,
+      navigation: action.navigation || "NAVIGATE",
+      overlayPosition: overlay ? { x: overlay.x, y: overlay.y } : null,
     };
   }
 
-  return { transition: null, triggerDelay: null, destinationId: null };
+  return best || EMPTY_REACTION;
 }
 
-function computeHoldDuration(
-  triggerDelay: number | null,
-  transitionDuration: number | null,
-  fallbackMs: number
-): number {
-  if (triggerDelay != null) return triggerDelay;
-  if (transitionDuration != null && transitionDuration > 0) {
-    return Math.max(transitionDuration * 1000 * 2, 500);
+function toTransitionSpec(transition: Transition | null): TransitionSpec | null {
+  if (!transition) return null;
+  return {
+    type: transition.type,
+    direction: (transition as DirectionalTransition).direction || "LEFT",
+    matchLayers: (transition as DirectionalTransition).matchLayers === true,
+    duration: transition.duration, // seconds
+    easing: toEasingSpec(transition.easing),
+  };
+}
+
+function toEasingSpec(easing: Easing | undefined): EasingSpec {
+  if (!easing) return { type: "EASE_IN_AND_OUT" };
+
+  const spec: EasingSpec = { type: easing.type };
+
+  if (easing.easingFunctionCubicBezier) {
+    const b = easing.easingFunctionCubicBezier;
+    spec.bezier = { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 };
   }
-  return fallbackMs;
+
+  if (easing.easingFunctionSpring) {
+    const s = easing.easingFunctionSpring;
+    spec.spring = {
+      mass: s.mass,
+      stiffness: s.stiffness,
+      damping: s.damping,
+      initialVelocity: s.initialVelocity,
+    };
+  } else if (SPRING_PRESETS[easing.type]) {
+    spec.spring = SPRING_PRESETS[easing.type];
+  }
+
+  return spec;
 }
 
-// --- Variant flow ---
+function needsLayerAnimation(t: TransitionSpec | null): boolean {
+  if (!t) return false;
+  return t.type === "SMART_ANIMATE" || t.matchLayers;
+}
 
-function findVariantFlow(
-  selection: ReadonlyArray<SceneNode>,
-  page: PageNode
-): FlowStep[] | null {
-  if (selection.length > 0) {
-    const sel = selection[0];
-    if (sel.type === "COMPONENT_SET") return walkVariants(sel);
-    if (sel.type === "COMPONENT" && sel.parent?.type === "COMPONENT_SET")
-      return walkVariants(sel.parent as ComponentSetNode);
-    if (sel.type === "INSTANCE") {
-      const main = sel.mainComponent;
-      if (main && main.parent?.type === "COMPONENT_SET")
-        return walkVariants(main.parent as ComponentSetNode);
+// --- Flow discovery ------------------------------------------------------
+
+interface FlowStep {
+  node: FlowNode;
+  reaction: ReactionData;
+}
+
+interface Flow {
+  steps: FlowStep[];
+  loopToIndex: number | null;
+}
+
+function discoverFlow(settings: PluginSettings): Flow | null {
+  const page = figma.currentPage;
+  const selection = page.selection;
+
+  if (settings.source !== "frames") {
+    const variantFlow = findVariantFlow(selection, page, settings.source === "variants");
+    if (variantFlow && variantFlow.steps.length > 0) return variantFlow;
+    if (settings.source === "variants") return null;
+  }
+
+  const start = findStartingFrame(page, selection);
+  if (!start) return null;
+  return walkFlow(start, (id) => {
+    const target = figma.getNodeById(id);
+    return target && (target.type === "FRAME" || target.type === "COMPONENT")
+      ? (target as FlowNode)
+      : null;
+  });
+}
+
+function walkFlow(
+  start: FlowNode,
+  resolve: (id: string) => FlowNode | null
+): Flow {
+  const steps: FlowStep[] = [];
+  const indexById = new Map<string, number>();
+  let current: FlowNode | null = start;
+  let loopToIndex: number | null = null;
+
+  while (current) {
+    if (indexById.has(current.id)) {
+      loopToIndex = indexById.get(current.id)!;
+      break;
     }
+    indexById.set(current.id, steps.length);
+
+    const reaction = extractReactionData(current);
+    steps.push({ node: current, reaction });
+
+    current = reaction.destinationId ? resolve(reaction.destinationId) : null;
   }
 
-  for (const child of page.children) {
-    if (child.type === "COMPONENT_SET") {
-      const flow = walkVariants(child);
-      if (flow.length > 1) return flow;
-    }
-  }
-
-  for (const child of page.children) {
-    if (child.type === "FRAME") {
-      const sets = findComponentSets(child);
-      for (const set of sets) {
-        const flow = walkVariants(set);
-        if (flow.length > 1) return flow;
-      }
-    }
-  }
-
-  return null;
+  return { steps, loopToIndex };
 }
 
-function findComponentSets(node: SceneNode): ComponentSetNode[] {
-  const results: ComponentSetNode[] = [];
-  if (node.type === "COMPONENT_SET") results.push(node);
-  if ("children" in node) {
-    for (const child of (node as any).children)
-      results.push(...findComponentSets(child));
-  }
-  return results;
-}
-
-function walkVariants(componentSet: ComponentSetNode): FlowStep[] {
-  const variants = componentSet.children.filter(
-    (c): c is ComponentNode => c.type === "COMPONENT"
-  );
-  if (variants.length === 0) return [];
-
-  const startVariant = findStartVariant(variants);
-  const chain = walkVariantChain(startVariant, variants);
-  if (chain.length > 1) return chain;
-
-  // Row-major order, matching how Figma lays out a variant grid
-  variants.sort((a, b) => a.y - b.y || a.x - b.x);
-  return variants.map((v) => ({
-    node: v,
-    transition: null,
-    triggerDelay: null,
-  }));
-}
-
-function findStartVariant(variants: ComponentNode[]): ComponentNode {
-  const targetIds = new Set<string>();
-  for (const v of variants) {
-    const { destinationId } = extractReactionData(v);
-    if (destinationId) targetIds.add(destinationId);
+function findStartingFrame(
+  page: PageNode,
+  selection: ReadonlyArray<SceneNode>
+): FlowNode | null {
+  for (const sel of selection) {
+    if (sel.type === "FRAME" || sel.type === "COMPONENT") return sel;
   }
 
-  for (const v of variants) {
-    if (!targetIds.has(v.id)) {
-      const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
-      if (reactions && reactions.length > 0) return v;
-    }
-  }
-  for (const v of variants) {
-    const reactions = (v as any).reactions as ReadonlyArray<Reaction> | undefined;
-    if (reactions && reactions.length > 0) return v;
-  }
-  return variants[0];
-}
-
-function walkVariantChain(start: ComponentNode, allVariants: ComponentNode[]): FlowStep[] {
-  const visited = new Set<string>();
-  const result: FlowStep[] = [];
-  const variantIds = new Set(allVariants.map((v) => v.id));
-  let current: ComponentNode | null = start;
-
-  while (current && !visited.has(current.id)) {
-    visited.add(current.id);
-    const { transition, triggerDelay, destinationId } = extractReactionData(current);
-    result.push({ node: current, transition, triggerDelay });
-
-    if (destinationId && variantIds.has(destinationId)) {
-      current = allVariants.find((v) => v.id === destinationId) || null;
-    } else {
-      current = null;
-    }
-  }
-
-  return result;
-}
-
-// --- Frame flow ---
-
-function findStartingFrame(page: PageNode): FrameNode | ComponentNode | null {
   const flowStarts = page.flowStartingPoints;
   if (flowStarts && flowStarts.length > 0) {
     const node = figma.getNodeById(flowStarts[0].nodeId);
@@ -229,137 +237,354 @@ function findStartingFrame(page: PageNode): FrameNode | ComponentNode | null {
   }
 
   const topFrames = page.children.filter(
-    (c): c is FrameNode | ComponentNode => c.type === "FRAME" || c.type === "COMPONENT"
+    (c): c is FlowNode => c.type === "FRAME" || c.type === "COMPONENT"
   );
 
   for (const frame of topFrames) {
-    const reactions = (frame as any).reactions as ReadonlyArray<Reaction> | undefined;
-    if (reactions && reactions.length > 0) return frame;
+    if (extractReactionData(frame).destinationId) return frame;
   }
 
   return topFrames[0] || null;
 }
 
-function walkPrototypeFlow(startNode: FrameNode | ComponentNode): FlowStep[] {
-  const visited = new Set<string>();
-  const result: FlowStep[] = [];
-  let current: FrameNode | ComponentNode | null = startNode;
+function findVariantFlow(
+  selection: ReadonlyArray<SceneNode>,
+  page: PageNode,
+  forced: boolean
+): Flow | null {
+  const fromSelection = componentSetFromSelection(selection);
+  if (fromSelection) return walkVariants(fromSelection);
 
-  while (current && !visited.has(current.id)) {
-    visited.add(current.id);
-    const { transition, triggerDelay, destinationId } = extractReactionData(current);
-    result.push({ node: current, transition, triggerDelay });
-
-    if (destinationId) {
-      const target = figma.getNodeById(destinationId);
-      current = target && (target.type === "FRAME" || target.type === "COMPONENT") ? target : null;
-    } else {
-      current = null;
+  for (const child of page.children) {
+    if (child.type === "COMPONENT_SET") {
+      const flow = walkVariants(child);
+      if (flow.steps.length > 1) return flow;
     }
   }
 
-  if (result.length <= 1) {
-    const topFrames = figma.currentPage.children.filter(
-      (c): c is FrameNode | ComponentNode =>
-        (c.type === "FRAME" || c.type === "COMPONENT") && !visited.has(c.id)
-    );
-    topFrames.sort((a, b) => a.x - b.x || a.y - b.y);
-    for (const frame of topFrames) {
-      if (!visited.has(frame.id)) {
-        visited.add(frame.id);
-        result.push({ node: frame, transition: null, triggerDelay: null });
+  for (const child of page.children) {
+    if (child.type === "FRAME") {
+      for (const set of findComponentSets(child)) {
+        const flow = walkVariants(set);
+        if (flow.steps.length > 1) return flow;
       }
     }
   }
 
-  return result;
+  return null;
 }
 
-// --- Export (send frames one by one to avoid OOM) ---
+function componentSetFromSelection(
+  selection: ReadonlyArray<SceneNode>
+): ComponentSetNode | null {
+  for (const sel of selection) {
+    if (sel.type === "COMPONENT_SET") return sel;
+    if (sel.type === "COMPONENT" && sel.parent?.type === "COMPONENT_SET") {
+      return sel.parent as ComponentSetNode;
+    }
+    if (sel.type === "INSTANCE") {
+      const main = sel.mainComponent;
+      if (main && main.parent?.type === "COMPONENT_SET") {
+        return main.parent as ComponentSetNode;
+      }
+    }
+  }
+  return null;
+}
 
-async function exportNodes(orderedFrames: FlowStep[], scale: number, fallbackHoldMs: number) {
-  const firstNode = orderedFrames[0].node;
-  let hasAutoTiming = false;
+function findComponentSets(node: SceneNode): ComponentSetNode[] {
+  const results: ComponentSetNode[] = [];
+  if (node.type === "COMPONENT_SET") results.push(node);
+  if ("children" in node) {
+    for (const child of (node as ChildrenMixin).children as SceneNode[]) {
+      results.push(...findComponentSets(child));
+    }
+  }
+  return results;
+}
+
+function walkVariants(componentSet: ComponentSetNode): Flow {
+  const variants = componentSet.children.filter(
+    (c): c is ComponentNode => c.type === "COMPONENT"
+  );
+  if (variants.length === 0) return { steps: [], loopToIndex: null };
+
+  const byId = new Map(variants.map((v) => [v.id, v]));
+  const start = findStartVariant(variants);
+  const flow = walkFlow(start, (id) => byId.get(id) || null);
+  if (flow.steps.length > 1) return flow;
+
+  // No interaction chain: fall back to the variant grid order (row-major).
+  const ordered = variants.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  return {
+    steps: ordered.map((node) => ({ node, reaction: EMPTY_REACTION })),
+    loopToIndex: null,
+  };
+}
+
+function findStartVariant(variants: ComponentNode[]): ComponentNode {
+  const targets = new Set<string>();
+  for (const v of variants) {
+    const id = extractReactionData(v).destinationId;
+    if (id) targets.add(id);
+  }
+
+  const withReactions = variants.filter((v) => extractReactionData(v).destinationId);
+  const entry = withReactions.find((v) => !targets.has(v.id));
+  return entry || withReactions[0] || variants[0];
+}
+
+// --- Layer decomposition for smart animate -------------------------------
+
+interface Decomposition {
+  layers: LayerSpec[];
+  layerImages: Uint8Array[];
+  baseImage: Uint8Array;
+}
+
+function frameOrigin(node: FlowNode): { x: number; y: number } {
+  const box = node.absoluteBoundingBox;
+  return box ? { x: box.x, y: box.y } : { x: node.x, y: node.y };
+}
+
+/** Render bounds include effects, matching what exportAsync rasterises. */
+function layerRect(child: SceneNode, origin: { x: number; y: number }): Rect | null {
+  const box = child as Partial<{
+    absoluteRenderBounds: { x: number; y: number; width: number; height: number } | null;
+    absoluteBoundingBox: { x: number; y: number; width: number; height: number } | null;
+  }>;
+  const bounds = box.absoluteRenderBounds || box.absoluteBoundingBox;
+  if (!bounds) return null;
+  return {
+    x: bounds.x - origin.x,
+    y: bounds.y - origin.y,
+    w: bounds.width,
+    h: bounds.height,
+  };
+}
+
+/**
+ * Splits a frame into its background plus one image per direct child, so the
+ * UI can move children independently the way Smart Animate does.
+ *
+ * Children are hidden on the real node while the background is exported and
+ * restored immediately afterwards — Figma has no API to render a subtree
+ * without them.
+ */
+async function decomposeFrame(
+  node: FlowNode,
+  scale: number
+): Promise<Decomposition | null> {
+  const children = node.children.filter((c) => c.visible);
+  if (children.length === 0 || children.length > MAX_ANIMATED_LAYERS) return null;
+
+  const origin = frameOrigin(node);
+  const layers: LayerSpec[] = [];
+  const layerImages: Uint8Array[] = [];
+  const nameCounts = new Map<string, number>();
+
+  for (const child of children) {
+    const rect = layerRect(child, origin);
+    if (!rect || rect.w <= 0 || rect.h <= 0) continue;
+
+    const image = await child.exportAsync({
+      format: "PNG",
+      constraint: { type: "SCALE", value: scale },
+    });
+
+    // Layers match across frames by name; disambiguate repeated names by order.
+    const seen = nameCounts.get(child.name) || 0;
+    nameCounts.set(child.name, seen + 1);
+
+    layers.push({
+      key: `${child.name}#${seen}`,
+      rect,
+      opacity: "opacity" in child ? (child as BlendMixin & SceneNode).opacity : 1,
+      imageIndex: layerImages.length,
+    });
+    layerImages.push(image);
+  }
+
+  if (layers.length === 0) return null;
+
+  const previous = children.map((c) => c.visible);
+  let baseImage: Uint8Array;
+  try {
+    for (const child of children) child.visible = false;
+    baseImage = await node.exportAsync({
+      format: "PNG",
+      constraint: { type: "SCALE", value: scale },
+    });
+  } finally {
+    children.forEach((child, i) => {
+      child.visible = previous[i];
+    });
+  }
+
+  return { layers, layerImages, baseImage };
+}
+
+// --- Export --------------------------------------------------------------
+
+function computeHold(
+  triggerDelay: number | null,
+  transition: TransitionSpec | null,
+  fallbackMs: number
+): number {
+  if (triggerDelay != null) return triggerDelay;
+  if (transition && transition.duration > 0) {
+    return Math.max(transition.duration * 1000, fallbackMs);
+  }
+  return fallbackMs;
+}
+
+async function exportPrototypeFlow(settings: PluginSettings) {
+  const flow = discoverFlow(settings);
+
+  if (!flow || flow.steps.length === 0) {
+    figma.ui.postMessage({
+      type: "error",
+      message:
+        "لم يتم العثور على أي بروتوتايب.\n\n" +
+        "جرّب:\n" +
+        "• اختر الـ Component Set أو الشاشة الأولى ثم شغّل البلاجن\n" +
+        "• أو غيّر «مصدر البروتوتايب» من الإعدادات",
+    });
+    return;
+  }
+
+  const { steps, loopToIndex } = flow;
+  const scale = settings.scale;
+  const warnings: string[] = [];
+
+  const canvasWidth = Math.max(...steps.map((s) => s.node.width));
+  const canvasHeight = Math.max(...steps.map((s) => s.node.height));
+
+  if (steps.some((s) => s.node.width !== canvasWidth || s.node.height !== canvasHeight)) {
+    warnings.push("الشاشات بأحجام مختلفة — تم توسيط كل شاشة داخل أكبر حجم.");
+  }
+
+  const perImage = canvasWidth * canvasHeight * scale * scale;
+  if (perImage > MAX_PIXELS_PER_IMAGE) {
+    figma.ui.postMessage({
+      type: "error",
+      message:
+        `الشاشة كبيرة زيادة على جودة ${scale}x ` +
+        `(${Math.round(perImage / 1_000_000)} مليون بكسل للصورة الواحدة).\n` +
+        `اختر جودة أقل.`,
+    });
+    return;
+  }
+  if (perImage * steps.length > MAX_PIXELS_TOTAL) {
+    warnings.push(
+      `حجم التصدير كبير (${steps.length} شاشات × ${scale}x) وممكن يبطّئ المتصفح. ` +
+        `لو علّق، جرّب جودة أقل.`
+    );
+  }
+
+  // A frame needs decomposition if it enters or leaves a smart-animate step.
+  const wantsLayers = steps.map((step, i) => {
+    const outgoing = needsLayerAnimation(step.reaction.transition);
+    const incomingFrom =
+      i > 0
+        ? steps[i - 1]
+        : loopToIndex === 0
+        ? steps[steps.length - 1]
+        : null;
+    const incoming = incomingFrom ? needsLayerAnimation(incomingFrom.reaction.transition) : false;
+    return outgoing || incoming;
+  });
 
   figma.ui.postMessage({
     type: "export-start",
-    totalFrames: orderedFrames.length,
-    canvasWidth: firstNode.width,
-    canvasHeight: firstNode.height,
+    totalFrames: steps.length,
+    canvasWidth,
+    canvasHeight,
     scale,
+    loopToIndex,
   });
 
-  for (let i = 0; i < orderedFrames.length; i++) {
-    const step = orderedFrames[i];
+  let hasAutoTiming = false;
+  let smartAnimateDowngraded = false;
 
-    let imageData: Uint8Array;
-    try {
-      imageData = await step.node.exportAsync({
-        format: "PNG",
-        constraint: { type: "SCALE", value: scale },
-      });
-    } catch (e) {
-      figma.ui.postMessage({
-        type: "error",
-        message:
-          `فشل تصدير "${step.node.name}" بجودة ${scale}x.\n` +
-          `جرّب جودة أقل (2x أو 1x) — الشاشة كبيرة زيادة على هذه الجودة.`,
-      });
-      return;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const { reaction } = step;
+
+    let decomposition: Decomposition | null = null;
+    if (wantsLayers[i]) {
+      try {
+        decomposition = await decomposeFrame(step.node, scale);
+        if (!decomposition) smartAnimateDowngraded = true;
+      } catch (e) {
+        decomposition = null;
+        smartAnimateDowngraded = true;
+      }
     }
 
-    const transitionDuration = step.transition?.duration ?? null;
-    const holdDuration = computeHoldDuration(step.triggerDelay, transitionDuration, fallbackHoldMs);
-    if (step.triggerDelay != null) hasAutoTiming = true;
+    let imageBytes: Uint8Array;
+    if (decomposition) {
+      imageBytes = decomposition.baseImage;
+    } else {
+      try {
+        imageBytes = await step.node.exportAsync({
+          format: "PNG",
+          constraint: { type: "SCALE", value: scale },
+        });
+      } catch (e) {
+        figma.ui.postMessage({
+          type: "error",
+          message:
+            `فشل تصدير "${step.node.name}" بجودة ${scale}x.\n` +
+            `جرّب جودة أقل.\n(${errorText(e)})`,
+        });
+        return;
+      }
+    }
 
-    const transitionInfo: TransitionInfo | null = step.transition
-      ? {
-          type: step.transition.type || "DISSOLVE",
-          direction: (step.transition as any).direction || "LEFT",
-          duration: step.transition.duration || 0.3,
-          easing: getEasingName(step.transition.easing),
-        }
-      : null;
+    if (reaction.triggerDelay != null) hasAutoTiming = true;
 
-    // Figma's postMessage supports Uint8Array but NOT ArrayBuffer.
+    const frame: FrameSpec = {
+      id: step.node.id,
+      name: step.node.name,
+      width: step.node.width,
+      height: step.node.height,
+      holdDuration: computeHold(
+        reaction.triggerDelay,
+        reaction.transition,
+        settings.fallbackHoldMs
+      ),
+      transition: reaction.transition,
+      navigation: reaction.navigation,
+      layers: decomposition ? decomposition.layers : null,
+      hasBaseImage: decomposition != null,
+      isOverlay: i > 0 && steps[i - 1].reaction.navigation === "OVERLAY",
+      overlayPosition: i > 0 ? steps[i - 1].reaction.overlayPosition : null,
+    };
+
     figma.ui.postMessage({
       type: "frame-data",
       index: i,
-      total: orderedFrames.length,
-      frame: {
-        id: step.node.id,
-        name: step.node.name,
-        width: step.node.width,
-        height: step.node.height,
-        transition: transitionInfo,
-        holdDuration,
-      },
-      imageBytes: imageData,
-      hasAutoTiming,
+      total: steps.length,
+      frame,
+      imageBytes,
+      layerImages: decomposition ? decomposition.layerImages : [],
     });
 
     figma.ui.postMessage({
       type: "progress",
       message: `تم تصدير: ${step.node.name}`,
-      total: orderedFrames.length,
+      total: steps.length,
       current: i + 1,
     });
   }
 
-  figma.ui.postMessage({ type: "export-complete", hasAutoTiming });
-}
-
-function getEasingName(easing: Easing): string {
-  if (!easing) return "ease-in-out";
-  switch (easing.type) {
-    case "EASE_IN": return "ease-in";
-    case "EASE_OUT": return "ease-out";
-    case "EASE_IN_AND_OUT": return "ease-in-out";
-    case "LINEAR": return "linear";
-    case "EASE_IN_BACK": return "ease-in-back";
-    case "EASE_OUT_BACK": return "ease-out-back";
-    case "EASE_IN_AND_OUT_BACK": return "ease-in-out-back";
-    case "GENTLE": return "gentle";
-    default: return "ease-in-out";
+  if (smartAnimateDowngraded) {
+    warnings.push(
+      `بعض شاشات Smart Animate فيها طبقات كثيرة (أكثر من ${MAX_ANIMATED_LAYERS}) — ` +
+        `تم استبدال الأنيميشن بتلاشي فيها.`
+    );
   }
+
+  figma.ui.postMessage({ type: "export-complete", hasAutoTiming, warnings });
 }

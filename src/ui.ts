@@ -1,109 +1,194 @@
-interface FrameData {
-  id: string;
-  name: string;
-  width: number;
-  height: number;
-  transition: {
-    type: string;
-    direction: string;
-    duration: number;
-    easing: string;
-  } | null;
-  holdDuration: number;
-}
+import {
+  DEFAULT_SETTINGS,
+  FrameSpec,
+  PluginSettings,
+} from "./shared/types";
+import { createSink, evenDimension, isMp4Supported } from "./ui/encoder";
+import {
+  countOutputFrames,
+  LoadedFrame,
+  LoadedLayer,
+  renderSequence,
+  Scene,
+} from "./ui/render";
 
-const FPS = 60;
-
-const EASING_FUNCTIONS: Record<string, (t: number) => number> = {
-  linear: (t) => t,
-  "ease-in": (t) => t * t * t,
-  "ease-out": (t) => 1 - Math.pow(1 - t, 3),
-  "ease-in-out": (t) =>
-    t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
-  "ease-in-back": (t) => {
-    const c = 1.70158;
-    return (c + 1) * t * t * t - c * t * t;
-  },
-  "ease-out-back": (t) => {
-    const c = 1.70158;
-    return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
-  },
-  "ease-in-out-back": (t) => {
-    const c = 1.70158 * 1.525;
-    return t < 0.5
-      ? (Math.pow(2 * t, 2) * ((c + 1) * 2 * t - c)) / 2
-      : (Math.pow(2 * t - 2, 2) * ((c + 1) * (t * 2 - 2) + c) + 2) / 2;
-  },
-  gentle: (t) =>
-    t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2,
-};
-
-function getEasing(name: string): (t: number) => number {
-  return EASING_FUNCTIONS[name] || EASING_FUNCTIONS["ease-in-out"];
-}
-
-let loadedImages: HTMLImageElement[] = [];
-let blobUrls: string[] = [];
-let framesData: FrameData[] = [];
-let canvasWidth = 0;
-let canvasHeight = 0;
+let scene: Scene | null = null;
 let exportScale = 4;
+let blobUrls: string[] = [];
+let pending: LoadedFrame[] = [];
 let previewAbort: AbortController | null = null;
 let renderAbort: AbortController | null = null;
+let previewLoop = false;
+let settings: PluginSettings = { ...DEFAULT_SETTINGS };
 
-window.onmessage = async (event) => {
+// --- Element helpers -----------------------------------------------------
+
+function el<T extends HTMLElement>(id: string): T {
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`Missing element: ${id}`);
+  return node as T;
+}
+
+function show(id: string, visible: boolean): void {
+  el(id).style.display = visible ? "" : "none";
+}
+
+// --- Messaging -----------------------------------------------------------
+
+window.onmessage = async (event: MessageEvent) => {
   const msg = event.data.pluginMessage;
   if (!msg) return;
 
-  if (msg.type === "progress") {
-    updateProgress(msg.message, msg.current, msg.total);
-  }
+  switch (msg.type) {
+    case "settings":
+      settings = msg.settings;
+      applySettings();
+      break;
 
-  if (msg.type === "error") {
-    showError(msg.message);
-  }
+    case "progress":
+      updateProgress(msg.message, msg.current, msg.total);
+      break;
 
-  if (msg.type === "export-start") {
-    cleanup();
-    canvasWidth = msg.canvasWidth;
-    canvasHeight = msg.canvasHeight;
-    exportScale = msg.scale;
-    framesData = [];
-    loadedImages = [];
-    blobUrls = [];
-  }
+    case "error":
+      showStatus(msg.message, "error");
+      setBusy(false);
+      break;
 
-  if (msg.type === "frame-data") {
-    const bytes = toUint8Array(msg.imageBytes);
-    if (bytes.length === 0) {
-      showError("فشل استقبال بيانات الصور من فيجما.");
-      return;
-    }
-    const blob = new Blob([new Uint8Array(bytes)], { type: "image/png" });
-    const url = URL.createObjectURL(blob);
-    blobUrls.push(url);
-    try {
-      const img = await loadImage(url);
-      loadedImages.push(img);
-      framesData.push(msg.frame);
-    } catch {
-      showError(`فشل تحميل صورة الشاشة "${msg.frame.name}".`);
-    }
-  }
+    case "export-start":
+      resetScene(msg);
+      break;
 
-  if (msg.type === "export-complete") {
-    showRenderReady(msg.hasAutoTiming);
+    case "frame-data":
+      await receiveFrame(msg);
+      break;
+
+    case "export-complete":
+      finishScene(msg.hasAutoTiming, msg.warnings || []);
+      break;
   }
 };
 
-function cleanup() {
-  for (const url of blobUrls) URL.revokeObjectURL(url);
-  blobUrls = [];
-  loadedImages = [];
-  framesData = [];
+function resetScene(msg: {
+  canvasWidth: number;
+  canvasHeight: number;
+  scale: number;
+  loopToIndex: number | null;
+}): void {
+  releaseUrls();
+  pending = [];
+  exportScale = msg.scale;
+  scene = {
+    frames: [],
+    loopToIndex: msg.loopToIndex,
+    width: msg.canvasWidth,
+    height: msg.canvasHeight,
+  };
+  show("render-section", false);
+  show("preview-section", false);
 }
 
-// Figma delivers a Uint8Array, but stay tolerant of other serializations.
+async function receiveFrame(msg: {
+  frame: FrameSpec;
+  imageBytes: unknown;
+  layerImages: unknown[];
+}): Promise<void> {
+  try {
+    const image = await decodeImage(msg.imageBytes);
+
+    let layers: LoadedLayer[] | null = null;
+    if (msg.frame.layers) {
+      const images = await Promise.all(
+        (msg.layerImages || []).map((bytes) => decodeImage(bytes))
+      );
+      layers = msg.frame.layers.map((layer) => ({
+        key: layer.key,
+        rect: layer.rect,
+        opacity: layer.opacity,
+        image: images[layer.imageIndex],
+      }));
+    }
+
+    pending.push({ spec: msg.frame, image, layers });
+  } catch (e) {
+    showStatus(`فشل تحميل صورة الشاشة "${msg.frame.name}".`, "error");
+  }
+}
+
+function finishScene(hasAutoTiming: boolean, warnings: string[]): void {
+  if (!scene || pending.length === 0) {
+    showStatus("ما وصلت أي شاشات صالحة.", "error");
+    return;
+  }
+
+  scene.frames = pending;
+  pending = [];
+
+  const fps = settings.fps;
+  const totalFrames = countOutputFrames(scene, fps);
+  const seconds = (totalFrames / fps).toFixed(1);
+  const smart = scene.frames.filter((f) => f.layers).length;
+
+  const lines = [
+    `${scene.frames.length} شاشات · ${scene.width}×${scene.height} · ${exportScale}x`,
+    `مدة الفيديو ≈ ${seconds} ثانية · ${fps} إطار/ثانية`,
+    hasAutoTiming ? "التوقيت مقروء من البروتوتايب" : "التوقيت من المدة الاحتياطية",
+  ];
+  if (smart > 0) lines.push(`Smart Animate مفعّل على ${smart} شاشة`);
+  if (scene.loopToIndex != null) lines.push("البروتوتايب بيرجع لأوله (loop)");
+
+  el("frame-info").textContent = lines.join("\n");
+  renderScreenList();
+
+  show("render-section", true);
+  show("progress-area", false);
+  showStatus(warnings.join("\n"), warnings.length ? "warn" : null);
+  setBusy(false);
+}
+
+function renderScreenList(): void {
+  if (!scene) return;
+  const list = el("screen-list");
+  list.innerHTML = "";
+
+  scene.frames.forEach((frame, i) => {
+    const row = document.createElement("div");
+    row.className = "screen-row";
+
+    const name = document.createElement("span");
+    name.className = "screen-name";
+    name.textContent = `${i + 1}. ${frame.spec.name}`;
+
+    const meta = document.createElement("span");
+    meta.className = "screen-meta";
+    const transition = frame.spec.transition;
+    const parts = [`${Math.round(frame.spec.holdDuration)}ms`];
+    if (transition) {
+      parts.push(`${transitionLabel(transition.type)} ${transition.duration}s`);
+    }
+    if (frame.layers) parts.push(`${frame.layers.length} طبقة`);
+    meta.textContent = parts.join(" · ");
+
+    row.append(name, meta);
+    list.appendChild(row);
+  });
+}
+
+function transitionLabel(type: string): string {
+  const labels: Record<string, string> = {
+    DISSOLVE: "تلاشي",
+    SMART_ANIMATE: "Smart Animate",
+    SCROLL_ANIMATE: "تمرير",
+    MOVE_IN: "دخول",
+    MOVE_OUT: "خروج",
+    PUSH: "دفع",
+    SLIDE_IN: "انزلاق داخل",
+    SLIDE_OUT: "انزلاق خارج",
+  };
+  return labels[type] || type;
+}
+
+// --- Image decoding ------------------------------------------------------
+
 function toUint8Array(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
@@ -114,407 +199,255 @@ function toUint8Array(value: unknown): Uint8Array {
   return new Uint8Array(0);
 }
 
-function loadImage(src: string): Promise<HTMLImageElement> {
+function decodeImage(value: unknown): Promise<HTMLImageElement> {
+  const bytes = toUint8Array(value);
+  if (bytes.length === 0) return Promise.reject(new Error("empty image"));
+
+  const url = URL.createObjectURL(
+    new Blob([new Uint8Array(bytes)], { type: "image/png" })
+  );
+  blobUrls.push(url);
+
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = src;
+    img.onerror = () => reject(new Error("decode failed"));
+    img.src = url;
   });
 }
 
-// --- Drawing transitions ---
-
-function drawTransition(
-  ctx: CanvasRenderingContext2D,
-  fromImg: HTMLImageElement,
-  toImg: HTMLImageElement,
-  type: string,
-  direction: string,
-  t: number,
-  w: number,
-  h: number
-): void {
-  switch (type) {
-    case "DISSOLVE":
-    case "SMART_ANIMATE":
-      ctx.globalAlpha = 1;
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      ctx.globalAlpha = t;
-      ctx.drawImage(toImg, 0, 0, w, h);
-      ctx.globalAlpha = 1;
-      break;
-
-    case "MOVE_IN":
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      drawSlideIn(ctx, toImg, direction, t, w, h);
-      break;
-
-    case "MOVE_OUT":
-      ctx.drawImage(toImg, 0, 0, w, h);
-      drawSlideOut(ctx, fromImg, direction, t, w, h);
-      break;
-
-    case "PUSH":
-      drawPush(ctx, fromImg, toImg, direction, t, w, h);
-      break;
-
-    case "SLIDE_IN":
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      drawSlideIn(ctx, toImg, direction, t, w, h);
-      break;
-
-    case "SLIDE_OUT":
-      ctx.drawImage(toImg, 0, 0, w, h);
-      drawSlideOut(ctx, fromImg, direction, t, w, h);
-      break;
-
-    default:
-      ctx.globalAlpha = 1 - t;
-      ctx.drawImage(fromImg, 0, 0, w, h);
-      ctx.globalAlpha = t;
-      ctx.drawImage(toImg, 0, 0, w, h);
-      ctx.globalAlpha = 1;
-      break;
-  }
+function releaseUrls(): void {
+  for (const url of blobUrls) URL.revokeObjectURL(url);
+  blobUrls = [];
 }
 
-function drawSlideIn(
-  ctx: CanvasRenderingContext2D, img: HTMLImageElement,
-  dir: string, t: number, w: number, h: number
-): void {
-  let x = 0, y = 0;
-  switch (dir) {
-    case "LEFT": x = w * (1 - t); break;
-    case "RIGHT": x = -w * (1 - t); break;
-    case "TOP": y = h * (1 - t); break;
-    case "BOTTOM": y = -h * (1 - t); break;
-  }
-  ctx.drawImage(img, x, y, w, h);
-}
-
-function drawSlideOut(
-  ctx: CanvasRenderingContext2D, img: HTMLImageElement,
-  dir: string, t: number, w: number, h: number
-): void {
-  let x = 0, y = 0;
-  switch (dir) {
-    case "LEFT": x = -w * t; break;
-    case "RIGHT": x = w * t; break;
-    case "TOP": y = -h * t; break;
-    case "BOTTOM": y = h * t; break;
-  }
-  ctx.drawImage(img, x, y, w, h);
-}
-
-function drawPush(
-  ctx: CanvasRenderingContext2D, fromImg: HTMLImageElement,
-  toImg: HTMLImageElement, dir: string, t: number, w: number, h: number
-): void {
-  switch (dir) {
-    case "LEFT":
-      ctx.drawImage(fromImg, -w * t, 0, w, h);
-      ctx.drawImage(toImg, w * (1 - t), 0, w, h);
-      break;
-    case "RIGHT":
-      ctx.drawImage(fromImg, w * t, 0, w, h);
-      ctx.drawImage(toImg, -w * (1 - t), 0, w, h);
-      break;
-    case "TOP":
-      ctx.drawImage(fromImg, 0, -h * t, w, h);
-      ctx.drawImage(toImg, 0, h * (1 - t), w, h);
-      break;
-    case "BOTTOM":
-      ctx.drawImage(fromImg, 0, h * t, w, h);
-      ctx.drawImage(toImg, 0, -h * (1 - t), w, h);
-      break;
-  }
-}
-
-// --- Shared render loop (used by both preview and export) ---
-
-interface RenderTarget {
-  ctx: CanvasRenderingContext2D;
-  w: number;
-  h: number;
-  onFrame: () => void;
-  onProgress?: (done: number, total: number) => void;
-  signal: AbortSignal;
-}
-
-async function renderLoop(target: RenderTarget): Promise<void> {
-  const { ctx, w, h, onFrame, onProgress, signal } = target;
-
-  for (let i = 0; i < loadedImages.length; i++) {
-    if (signal.aborted) return;
-    if (onProgress) onProgress(i, loadedImages.length);
-
-    const frame = framesData[i];
-    const img = loadedImages[i];
-
-    ctx.clearRect(0, 0, w, h);
-    ctx.drawImage(img, 0, 0, w, h);
-    onFrame();
-
-    // Hold
-    const holdFrameCount = Math.max(Math.round((frame.holdDuration / 1000) * FPS), 1);
-    for (let f = 1; f < holdFrameCount; f++) {
-      if (signal.aborted) return;
-      onFrame();
-      await nextTick();
-    }
-
-    // Transition to next
-    if (i < loadedImages.length - 1) {
-      const nextImg = loadedImages[i + 1];
-      const trans = frame.transition;
-
-      if (trans && trans.duration > 0) {
-        const totalTransFrames = Math.max(Math.round(trans.duration * FPS), 1);
-        const easingFn = getEasing(trans.easing);
-
-        for (let f = 0; f <= totalTransFrames; f++) {
-          if (signal.aborted) return;
-          const t = easingFn(f / totalTransFrames);
-          ctx.clearRect(0, 0, w, h);
-          drawTransition(ctx, img, nextImg, trans.type, trans.direction, t, w, h);
-          onFrame();
-          await nextTick();
-        }
-      }
-    }
-  }
-}
-
-function nextTick(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
-
-// --- Preview ---
+// --- Preview -------------------------------------------------------------
 
 async function runPreview(): Promise<void> {
-  if (loadedImages.length === 0) return;
+  if (!scene || scene.frames.length === 0) return;
 
-  if (previewAbort) previewAbort.abort();
+  previewAbort?.abort();
   previewAbort = new AbortController();
+  const signal = previewAbort.signal;
 
-  const previewSection = document.getElementById("preview-section")!;
-  const previewCanvas = document.getElementById("preview-canvas") as HTMLCanvasElement;
-  const previewBtn = document.getElementById("preview-btn") as HTMLButtonElement;
-  const stopBtn = document.getElementById("stop-preview-btn") as HTMLButtonElement;
+  show("preview-section", true);
+  show("preview-btn", false);
+  show("stop-preview-btn", true);
 
-  previewSection.style.display = "block";
+  const canvas = el<HTMLCanvasElement>("preview-canvas");
+  // Previewing at 1x keeps playback smooth regardless of export quality.
+  const previewScale = Math.min(1, 440 / scene.width);
+  canvas.width = Math.round(scene.width * previewScale);
+  canvas.height = Math.round(scene.height * previewScale);
+  canvas.style.width = `${canvas.width}px`;
 
-  const maxW = 440;
-  const aspect = canvasHeight / canvasWidth;
-  const displayW = Math.min(maxW, canvasWidth);
-  const displayH = Math.round(displayW * aspect);
-
-  previewCanvas.width = canvasWidth;
-  previewCanvas.height = canvasHeight;
-  previewCanvas.style.width = displayW + "px";
-  previewCanvas.style.height = displayH + "px";
-
-  const ctx = previewCanvas.getContext("2d", { alpha: false })!;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
-
-  previewBtn.style.display = "none";
-  stopBtn.style.display = "block";
-
-  const target: RenderTarget = {
-    ctx,
-    w: canvasWidth,
-    h: canvasHeight,
-    onFrame: () => {},
-    signal: previewAbort.signal,
-  };
-
-  await renderLoop(target);
-
-  stopBtn.style.display = "none";
-  previewBtn.style.display = "block";
-}
-
-function stopPreview() {
-  if (previewAbort) {
-    previewAbort.abort();
-    previewAbort = null;
-  }
-  const stopBtn = document.getElementById("stop-preview-btn") as HTMLButtonElement;
-  const previewBtn = document.getElementById("preview-btn") as HTMLButtonElement;
-  stopBtn.style.display = "none";
-  previewBtn.style.display = "block";
-}
-
-// --- Video export ---
-
-function isRecordingSupported(): boolean {
-  return (
-    typeof MediaRecorder !== "undefined" &&
-    typeof HTMLCanvasElement.prototype.captureStream === "function" &&
-    (MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ||
-      MediaRecorder.isTypeSupported("video/webm;codecs=vp8"))
-  );
-}
-
-async function renderVideo(): Promise<void> {
-  if (loadedImages.length === 0) return;
-
-  if (!isRecordingSupported()) {
-    showError(
-      "متصفحك ما بيدعم تسجيل الفيديو (MediaRecorder/WebM).\n" +
-        "استخدم تطبيق فيجما للديسكتوب أو متصفح Chrome."
-    );
-    return;
-  }
-
-  if (previewAbort) previewAbort.abort();
-  renderAbort = new AbortController();
-
-  const renderBtn = document.getElementById("render-btn") as HTMLButtonElement;
-  const cancelRenderBtn = document.getElementById("cancel-render-btn") as HTMLButtonElement;
-  renderBtn.disabled = true;
-  renderBtn.textContent = "جاري إنشاء الفيديو...";
-  cancelRenderBtn.style.display = "block";
-
-  const w = canvasWidth * exportScale;
-  const h = canvasHeight * exportScale;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
   const ctx = canvas.getContext("2d", { alpha: false })!;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
 
-  const bitrateSelect = document.getElementById("bitrate") as HTMLSelectElement;
-  const bitrate = parseInt(bitrateSelect.value);
+  do {
+    await renderSequence({
+      scene,
+      ctx,
+      scale: previewScale,
+      fps: settings.fps,
+      emit: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
+      signal,
+    });
+  } while (previewLoop && !signal.aborted);
 
-  const stream = canvas.captureStream(0);
-  const track = stream.getVideoTracks()[0] as any;
+  if (!signal.aborted) stopPreview();
+}
 
-  const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-    ? "video/webm;codecs=vp9"
-    : "video/webm;codecs=vp8";
+function stopPreview(): void {
+  previewAbort?.abort();
+  previewAbort = null;
+  show("stop-preview-btn", false);
+  show("preview-btn", true);
+}
 
-  const recorder = new MediaRecorder(stream, {
-    mimeType,
-    videoBitsPerSecond: bitrate,
-  });
+// --- Export --------------------------------------------------------------
 
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
+async function exportVideo(): Promise<void> {
+  if (!scene || scene.frames.length === 0) return;
 
-  const videoReady = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => resolve(new Blob(chunks, { type: "video/webm" }));
-  });
+  previewAbort?.abort();
+  renderAbort = new AbortController();
+  const signal = renderAbort.signal;
 
-  recorder.start();
+  const renderBtn = el<HTMLButtonElement>("render-btn");
+  renderBtn.disabled = true;
+  renderBtn.textContent = "جاري إنشاء الفيديو...";
+  show("cancel-render-btn", true);
+  showStatus("", null);
 
-  const target: RenderTarget = {
-    ctx,
-    w,
-    h,
-    onFrame: () => { if (track.requestFrame) track.requestFrame(); },
-    onProgress: (done, total) =>
-      updateProgress(`جاري إنشاء الفيديو: ${done + 1}/${total}`, done + 1, total),
-    signal: renderAbort.signal,
-  };
+  const width = evenDimension(Math.round(scene.width * exportScale));
+  const height = evenDimension(Math.round(scene.height * exportScale));
 
-  await renderLoop(target);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { alpha: false })!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
 
-  recorder.stop();
+  const fps = settings.fps;
+  const totalFrames = countOutputFrames(scene, fps);
+  let emitted = 0;
 
-  if (renderAbort.signal.aborted) {
-    cancelRenderBtn.style.display = "none";
+  try {
+    const sink = await createSink(settings.format, {
+      canvas,
+      width,
+      height,
+      fps,
+      bitrate: settings.bitrate,
+    });
+
+    signal.addEventListener("abort", () => sink.abort());
+
+    await renderSequence({
+      scene,
+      ctx,
+      scale: exportScale,
+      fps,
+      emit: async () => {
+        await sink.addFrame();
+        emitted++;
+        if (emitted % 5 === 0) {
+          updateProgress(
+            `ترميز الفيديو: ${Math.round((emitted / totalFrames) * 100)}%`,
+            emitted,
+            totalFrames
+          );
+        }
+      },
+      signal,
+    });
+
+    if (signal.aborted) {
+      sink.abort();
+      showStatus("تم إلغاء التصدير.", "warn");
+      return;
+    }
+
+    const result = await sink.finish();
+    downloadBlob(result.blob, `prototype-export.${result.extension}`);
+
+    const sizeMB = (result.blob.size / (1024 * 1024)).toFixed(1);
+    const note = result.note ? `\n${result.note}` : "";
+    showStatus(
+      `تم التصدير بنجاح — ${result.format.toUpperCase()} · ${sizeMB} MB${note}`,
+      "success"
+    );
+  } catch (e) {
+    showStatus(
+      `فشل التصدير:\n${e instanceof Error ? e.message : String(e)}`,
+      "error"
+    );
+  } finally {
+    renderAbort = null;
     renderBtn.disabled = false;
     renderBtn.textContent = "تصدير فيديو";
-    showError("تم إلغاء التصدير");
-    return;
+    show("cancel-render-btn", false);
+    show("progress-area", false);
   }
+}
 
-  const videoBlob = await videoReady;
-
-  const url = URL.createObjectURL(videoBlob);
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "prototype-export.webm";
+  a.download = filename;
   a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-
-  const sizeMB = (videoBlob.size / (1024 * 1024)).toFixed(1);
-
-  cancelRenderBtn.style.display = "none";
-  renderBtn.disabled = false;
-  renderBtn.textContent = "تصدير فيديو";
-
-  showSuccess(`تم تصدير الفيديو بنجاح (${sizeMB} MB)`);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-function cancelRender() {
-  if (renderAbort) {
-    renderAbort.abort();
-    renderAbort = null;
-  }
-}
-
-// --- UI helpers ---
+// --- Status and progress -------------------------------------------------
 
 function updateProgress(message: string, current: number, total: number): void {
-  const el = document.getElementById("progress-area")!;
-  const bar = document.getElementById("progress-bar")!;
-  const text = document.getElementById("progress-text")!;
-  el.style.display = "block";
-  bar.style.width = `${(current / total) * 100}%`;
-  text.textContent = message;
+  show("progress-area", true);
+  el("progress-bar").style.width = `${Math.min((current / total) * 100, 100)}%`;
+  el("progress-text").textContent = message;
 }
 
-function showError(message: string): void {
-  const el = document.getElementById("status")!;
-  el.textContent = message;
-  el.className = "status error";
-  el.style.display = "block";
+function showStatus(message: string, kind: "error" | "success" | "warn" | null): void {
+  const node = el("status");
+  if (!message || !kind) {
+    node.style.display = "none";
+    return;
+  }
+  node.textContent = message;
+  node.className = `status ${kind}`;
+  node.style.display = "block";
 }
 
-function showSuccess(message: string): void {
-  const el = document.getElementById("status")!;
-  el.textContent = message;
-  el.className = "status success";
-  el.style.display = "block";
+function setBusy(busy: boolean): void {
+  el<HTMLButtonElement>("export-btn").disabled = busy;
+  el<HTMLButtonElement>("export-btn").textContent = busy
+    ? "جاري القراءة..."
+    : "قراءة البروتوتايب";
 }
 
-function showRenderReady(hasAutoTiming: boolean): void {
-  const renderSection = document.getElementById("render-section")!;
-  renderSection.style.display = "block";
+// --- Settings ------------------------------------------------------------
 
-  const info = document.getElementById("frame-info")!;
-  const timingBadge = hasAutoTiming ? "التوقيت من البروتوتايب" : "توقيت احتياطي";
-  info.textContent = `${loadedImages.length} شاشات — ${canvasWidth}×${canvasHeight} @ ${exportScale}x — ${timingBadge}`;
-
-  const progressArea = document.getElementById("progress-area")!;
-  progressArea.style.display = "none";
-
-  const status = document.getElementById("status")!;
-  status.style.display = "none";
+function applySettings(): void {
+  el<HTMLSelectElement>("scale").value = String(settings.scale);
+  el<HTMLSelectElement>("fps").value = String(settings.fps);
+  el<HTMLSelectElement>("bitrate").value = String(settings.bitrate);
+  el<HTMLSelectElement>("format").value = settings.format;
+  el<HTMLSelectElement>("source").value = settings.source;
+  el<HTMLInputElement>("hold-duration").value = String(settings.fallbackHoldMs);
 }
 
-// --- Init ---
+function collectSettings(): PluginSettings {
+  return {
+    scale: parseInt(el<HTMLSelectElement>("scale").value),
+    fps: parseInt(el<HTMLSelectElement>("fps").value),
+    bitrate: parseInt(el<HTMLSelectElement>("bitrate").value),
+    format: el<HTMLSelectElement>("format").value as "mp4" | "webm",
+    source: el<HTMLSelectElement>("source").value as PluginSettings["source"],
+    fallbackHoldMs: parseInt(el<HTMLInputElement>("hold-duration").value) || 1000,
+  };
+}
+
+// --- Init ----------------------------------------------------------------
 
 document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("export-btn")!.addEventListener("click", () => {
-    const scale = parseInt((document.getElementById("scale") as HTMLSelectElement).value);
-    const fallbackHoldMs = parseInt((document.getElementById("hold-duration") as HTMLInputElement).value);
-    parent.postMessage({ pluginMessage: { type: "start-export", scale, fallbackHoldMs } }, "*");
+  if (!isMp4Supported()) {
+    el("format-note").textContent =
+      "متصفحك ما بيدعم MP4 — راح يتم التصدير بصيغة WebM.";
+  }
+
+  el("export-btn").addEventListener("click", () => {
+    settings = collectSettings();
+    setBusy(true);
+    showStatus("", null);
+    parent.postMessage(
+      { pluginMessage: { type: "start-export", settings } },
+      "*"
+    );
   });
 
-  document.getElementById("preview-btn")!.addEventListener("click", () => runPreview());
-  document.getElementById("stop-preview-btn")!.addEventListener("click", () => stopPreview());
-  document.getElementById("render-btn")!.addEventListener("click", () => renderVideo());
-  document.getElementById("cancel-render-btn")!.addEventListener("click", () => cancelRender());
-  document.getElementById("cancel-btn")!.addEventListener("click", () => {
+  el("preview-btn").addEventListener("click", () => runPreview());
+  el("stop-preview-btn").addEventListener("click", () => stopPreview());
+  el("render-btn").addEventListener("click", () => exportVideo());
+  el("cancel-render-btn").addEventListener("click", () => renderAbort?.abort());
+
+  el<HTMLInputElement>("loop-preview").addEventListener("change", (e) => {
+    previewLoop = (e.target as HTMLInputElement).checked;
+  });
+
+  el("toggle-list").addEventListener("click", () => {
+    const list = el("screen-list");
+    const open = list.style.display !== "none";
+    list.style.display = open ? "none" : "block";
+    el("toggle-list").textContent = open ? "عرض الشاشات ▾" : "إخفاء الشاشات ▴";
+  });
+
+  el("cancel-btn").addEventListener("click", () => {
     parent.postMessage({ pluginMessage: { type: "cancel" } }, "*");
   });
+
+  parent.postMessage({ pluginMessage: { type: "ui-ready" } }, "*");
 });

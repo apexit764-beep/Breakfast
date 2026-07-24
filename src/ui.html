@@ -8,23 +8,18 @@
     padding: 16px;
     direction: rtl;
   }
-  h2 {
-    font-size: 16px;
-    font-weight: 700;
-    margin-bottom: 16px;
-    text-align: center;
-  }
-  .section { margin-bottom: 14px; }
+  h2 { font-size: 16px; font-weight: 700; margin-bottom: 14px; text-align: center; }
+  .section { margin-bottom: 12px; }
   label {
     display: block;
     font-weight: 600;
-    margin-bottom: 6px;
-    font-size: 12px;
+    margin-bottom: 5px;
+    font-size: 11px;
     color: var(--figma-color-text-secondary, #666);
   }
   select, input[type="number"] {
     width: 100%;
-    padding: 8px 10px;
+    padding: 7px 9px;
     border: 1px solid var(--figma-color-border, #ddd);
     border-radius: 6px;
     background: var(--figma-color-bg, #fff);
@@ -37,6 +32,8 @@
     border-color: #0d99ff;
     box-shadow: 0 0 0 2px rgba(13, 153, 255, 0.2);
   }
+  .row { display: flex; gap: 10px; }
+  .row > .section { flex: 1; }
   .btn {
     display: block;
     width: 100%;
@@ -46,120 +43,185 @@
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s;
   }
+  .btn:disabled { background: #999 !important; cursor: not-allowed; }
   .btn-primary { background: #0d99ff; color: #fff; }
-  .btn-primary:hover { background: #0b87e0; }
-  .btn-primary:disabled { background: #999; cursor: not-allowed; }
+  .btn-primary:hover:not(:disabled) { background: #0b87e0; }
   .btn-success { background: #14ae5c; color: #fff; margin-top: 8px; }
-  .btn-success:hover { background: #119a4f; }
-  .btn-success:disabled { background: #999; cursor: not-allowed; }
+  .btn-success:hover:not(:disabled) { background: #119a4f; }
   .btn-preview { background: #7b61ff; color: #fff; margin-top: 8px; }
-  .btn-preview:hover { background: #6a4fff; }
+  .btn-preview:hover:not(:disabled) { background: #6a4fff; }
   .btn-danger { background: #f24822; color: #fff; margin-top: 6px; }
-  .btn-danger:hover { background: #d93d1a; }
+  .btn-danger:hover:not(:disabled) { background: #d93d1a; }
   .btn-secondary {
     background: transparent;
     color: var(--figma-color-text-secondary, #666);
     border: 1px solid var(--figma-color-border, #ddd);
     margin-top: 8px;
   }
-  .btn-secondary:hover { background: var(--figma-color-bg-hover, #f5f5f5); }
-
-  #progress-area { display: none; margin: 14px 0; }
+  .help-text {
+    font-size: 10px;
+    color: var(--figma-color-text-tertiary, #999);
+    margin-top: 3px;
+  }
+  #progress-area { display: none; margin: 12px 0; }
   .progress-track {
     width: 100%;
     height: 6px;
     background: var(--figma-color-border, #e5e5e5);
     border-radius: 3px;
     overflow: hidden;
-    margin-bottom: 8px;
+    margin-bottom: 6px;
   }
   .progress-fill {
     height: 100%;
     background: #0d99ff;
     border-radius: 3px;
     width: 0%;
-    transition: width 0.2s;
+    transition: width 0.15s;
   }
   #progress-text {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--figma-color-text-secondary, #666);
     text-align: center;
   }
   .status {
     display: none;
-    padding: 10px 12px;
+    padding: 9px 11px;
     border-radius: 6px;
     margin: 10px 0;
-    font-size: 12px;
+    font-size: 11px;
     text-align: center;
+    white-space: pre-line;
+    line-height: 1.5;
   }
   .status.error { background: #fee; color: #c00; border: 1px solid #fcc; }
   .status.success { background: #efe; color: #080; border: 1px solid #cfc; }
+  .status.warn { background: #fff8e1; color: #8a6100; border: 1px solid #ffe0a3; }
   #render-section { display: none; }
   #frame-info {
     text-align: center;
-    font-size: 12px;
-    color: var(--figma-color-text-secondary, #666);
-    margin-bottom: 8px;
-    direction: ltr;
-  }
-  .help-text {
     font-size: 11px;
-    color: var(--figma-color-text-tertiary, #999);
-    margin-top: 4px;
+    color: var(--figma-color-text-secondary, #666);
+    margin: 10px 0 8px;
+    white-space: pre-line;
+    line-height: 1.7;
   }
-  .row { display: flex; gap: 12px; }
-  .row > .section { flex: 1; }
-
-  #preview-section { display: none; margin: 12px 0; }
+  #toggle-list {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    color: #0d99ff;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 4px;
+    font-family: inherit;
+  }
+  #screen-list {
+    display: none;
+    max-height: 140px;
+    overflow-y: auto;
+    border: 1px solid var(--figma-color-border, #ddd);
+    border-radius: 6px;
+    margin-bottom: 8px;
+  }
+  .screen-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 9px;
+    font-size: 11px;
+    border-bottom: 1px solid var(--figma-color-border, #eee);
+  }
+  .screen-row:last-child { border-bottom: none; }
+  .screen-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .screen-meta { color: var(--figma-color-text-tertiary, #999); flex-shrink: 0; direction: ltr; }
+  #preview-section { display: none; margin: 10px 0; }
   #preview-canvas {
     display: block;
     margin: 0 auto;
     border-radius: 8px;
     border: 1px solid var(--figma-color-border, #ddd);
     background: #000;
+    max-width: 100%;
   }
-  #stop-preview-btn { display: none; }
-  #cancel-render-btn { display: none; }
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    justify-content: center;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--figma-color-text-secondary, #666);
+  }
+  .checkbox-row input { width: auto; }
+  #stop-preview-btn, #cancel-render-btn { display: none; }
 </style>
 
 <h2>تصدير البروتوتايب كفيديو</h2>
 
 <div class="section">
-  <label>جودة التصدير</label>
-  <select id="scale">
-    <option value="1">1x — سريع</option>
-    <option value="2">2x — متوسط</option>
-    <option value="3">3x — عالي</option>
-    <option value="4" selected>4x — أعلى جودة</option>
+  <label>مصدر البروتوتايب</label>
+  <select id="source">
+    <option value="auto">تلقائي</option>
+    <option value="frames">الشاشات (Frames)</option>
+    <option value="variants">الـ Variants</option>
   </select>
+  <p class="help-text">اختر «الشاشات» أو «الـ Variants» لو التلقائي أخذ الغلط</p>
 </div>
 
 <div class="row">
   <div class="section">
-    <label>مدة احتياطية (ms)</label>
-    <input type="number" id="hold-duration" value="1000" min="100" max="10000" step="100" />
-    <p class="help-text">فقط إذا ما في توقيت في البروتوتايب</p>
+    <label>جودة التصدير</label>
+    <select id="scale">
+      <option value="1">1x — سريع</option>
+      <option value="2">2x — متوسط</option>
+      <option value="3">3x — عالي</option>
+      <option value="4">4x — أعلى جودة</option>
+    </select>
+  </div>
+  <div class="section">
+    <label>إطار/ثانية</label>
+    <select id="fps">
+      <option value="24">24 — سينمائي</option>
+      <option value="30">30 — قياسي</option>
+      <option value="60">60 — ناعم</option>
+    </select>
+  </div>
+</div>
+
+<div class="row">
+  <div class="section">
+    <label>صيغة الملف</label>
+    <select id="format">
+      <option value="mp4">MP4 — يشتغل بكل مكان</option>
+      <option value="webm">WebM</option>
+    </select>
+    <p class="help-text" id="format-note"></p>
   </div>
   <div class="section">
     <label>جودة الفيديو</label>
     <select id="bitrate">
       <option value="5000000">5 Mbps</option>
       <option value="10000000">10 Mbps</option>
-      <option value="20000000" selected>20 Mbps</option>
+      <option value="20000000">20 Mbps</option>
       <option value="40000000">40 Mbps</option>
     </select>
   </div>
 </div>
 
+<div class="section">
+  <label>مدة احتياطية لكل شاشة (ms)</label>
+  <input type="number" id="hold-duration" value="1000" min="100" max="20000" step="100" />
+  <p class="help-text">تُستخدم فقط للشاشات اللي ما فيها توقيت في البروتوتايب</p>
+</div>
+
 <button id="export-btn" class="btn btn-primary">قراءة البروتوتايب</button>
 
 <div id="progress-area">
-  <div class="progress-track">
-    <div class="progress-fill" id="progress-bar"></div>
-  </div>
+  <div class="progress-track"><div class="progress-fill" id="progress-bar"></div></div>
   <div id="progress-text"></div>
 </div>
 
@@ -167,12 +229,18 @@
 
 <div id="render-section">
   <div id="frame-info"></div>
+  <button id="toggle-list">عرض الشاشات ▾</button>
+  <div id="screen-list"></div>
 
   <button id="preview-btn" class="btn btn-preview">معاينة</button>
   <button id="stop-preview-btn" class="btn btn-danger">إيقاف المعاينة</button>
 
   <div id="preview-section">
     <canvas id="preview-canvas"></canvas>
+    <div class="checkbox-row">
+      <input type="checkbox" id="loop-preview" />
+      <label for="loop-preview" style="margin: 0">تكرار المعاينة</label>
+    </div>
   </div>
 
   <button id="render-btn" class="btn btn-success">تصدير فيديو</button>
