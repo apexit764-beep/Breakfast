@@ -16,6 +16,7 @@ const { values: args } = parseArgs({
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
     debug:    { type: 'boolean', default: false },
+    nodetect: { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -39,6 +40,7 @@ if (!args.url) {
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
+    --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
@@ -68,7 +70,7 @@ console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s`);
-console.log(`Idle stop: ${args.idle}s of no change`);
+console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log();
 
@@ -129,7 +131,8 @@ process.stdin.on('data', (key) => {
   }
 });
 
-let previousShot = await page.screenshot({ type: 'png' });
+const detectIdle = !args.nodetect;
+let previousShot = detectIdle ? await page.screenshot({ type: 'png' }) : null;
 let idleStart = null;
 let lastClickTime = 0;
 let lastProbe = '';
@@ -171,6 +174,8 @@ while (Date.now() - startTime < maxDuration) {
       }
     }
   }
+
+  if (!detectIdle) continue;
 
   const currentShot = await page.screenshot({ type: 'png' });
   const changed = !previousShot.equals(currentShot);
