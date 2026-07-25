@@ -50,7 +50,12 @@ const clickPause = parseInt(args.pause) * 1000;
 const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 
-console.log(`Recording: ${args.url}`);
+// Force fit-screen scaling in the prototype URL
+const protoUrl = new URL(args.url);
+protoUrl.searchParams.set('scaling', 'scale-down-width');
+const finalUrl = protoUrl.toString();
+
+console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.idle}s of no change`);
@@ -76,7 +81,7 @@ const context = await browser.newContext({
 const page = await context.newPage();
 
 console.log('Opening prototype...');
-await page.goto(args.url, { waitUntil: 'load', timeout: 60_000 });
+await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
 console.log('Waiting for prototype to load...');
 await page.waitForTimeout(5000);
 
