@@ -1,5 +1,5 @@
-import { chromium } from '@playwright/test';
 import { parseArgs } from 'node:util';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -17,6 +17,8 @@ const { values: args } = parseArgs({
     headless: { type: 'boolean', default: false },
     debug:    { type: 'boolean', default: false },
     nodetect: { type: 'boolean', default: false },
+    fps:      { type: 'string',  default: '60' },
+    bitrate:  { type: 'string',  default: '8' },
   },
   strict: false,
 });
@@ -41,6 +43,8 @@ if (!args.url) {
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
     --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
+    --fps           Video framerate (default: 60, Playwright's own default is 25)
+    --bitrate       Video bitrate in Mbps (default: 8, Playwright's default is 1)
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
@@ -49,6 +53,64 @@ if (!args.url) {
   `);
   process.exit(0);
 }
+
+const fps = parseInt(args.fps);
+const bitrate = parseInt(args.bitrate);
+
+// These get written into Playwright's own source, so a bad value would corrupt
+// the install rather than just fail this run.
+if (!Number.isInteger(fps) || fps < 1 || fps > 120) {
+  console.error(`Invalid --fps "${args.fps}" (expected an integer between 1 and 120)`);
+  process.exit(1);
+}
+if (!Number.isInteger(bitrate) || bitrate < 1 || bitrate > 100) {
+  console.error(`Invalid --bitrate "${args.bitrate}" (expected an integer between 1 and 100)`);
+  process.exit(1);
+}
+
+// Playwright hardcodes 25fps / 1Mbps VP8 for video recording, with no API to
+// change either. Rewrite those constants in the installed bundle before the
+// module is loaded. Patterns are matched loosely so re-running is idempotent.
+function patchPlaywrightEncoder(fps, bitrate) {
+  const require = createRequire(import.meta.url);
+  let bundle;
+  try {
+    bundle = path.join(path.dirname(require.resolve('playwright-core')), 'lib', 'coreBundle.js');
+  } catch {
+    return 'playwright-core not found';
+  }
+
+  let src;
+  try {
+    src = fs.readFileSync(bundle, 'utf8');
+  } catch (err) {
+    return `cannot read bundle (${err.code})`;
+  }
+
+  const edits = [
+    [/fps = \d+;/, `fps = ${fps};`],
+    [/-b:v \d+M/, `-b:v ${bitrate}M`],
+    [/-threads \d+/, '-threads 4'],
+  ];
+
+  let patched = src;
+  for (const [pattern, replacement] of edits) {
+    if (!pattern.test(patched)) return `pattern not found: ${pattern}`;
+    patched = patched.replace(pattern, replacement);
+  }
+
+  if (patched === src) return null; // already at these settings
+
+  try {
+    fs.writeFileSync(bundle, patched);
+  } catch (err) {
+    return `cannot write bundle (${err.code})`;
+  }
+  return null;
+}
+
+const patchError = patchPlaywrightEncoder(fps, bitrate);
+const { chromium } = await import('@playwright/test');
 
 const width = parseInt(args.width);
 const height = parseInt(args.height);
@@ -72,6 +134,11 @@ console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
+if (patchError) {
+  console.log(`Video:     25fps @1Mbps (Playwright default — patch skipped: ${patchError})`);
+} else {
+  console.log(`Video:     ${fps}fps @${bitrate}Mbps`);
+}
 console.log();
 
 const browser = await chromium.launch({
@@ -132,7 +199,7 @@ process.stdin.on('data', (key) => {
 });
 
 const detectIdle = !args.nodetect;
-let previousShot = detectIdle ? await page.screenshot({ type: 'png' }) : null;
+let previousShot = detectIdle ? await page.screenshot({ type: 'jpeg', quality: 40 }) : null;
 let idleStart = null;
 let lastClickTime = 0;
 let lastProbe = '';
@@ -177,7 +244,7 @@ while (Date.now() - startTime < maxDuration) {
 
   if (!detectIdle) continue;
 
-  const currentShot = await page.screenshot({ type: 'png' });
+  const currentShot = await page.screenshot({ type: 'jpeg', quality: 40 });
   const changed = !previousShot.equals(currentShot);
 
   if (changed) {
