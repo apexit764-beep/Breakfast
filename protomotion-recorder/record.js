@@ -21,6 +21,7 @@ const { values: args } = parseArgs({
     bitrate:  { type: 'string',  default: '8' },
     scaling:  { type: 'string',  default: 'contain' },
     cursor:   { type: 'boolean', default: false },
+    fit:      { type: 'boolean', default: false },
     'save-clicks': { type: 'string' },
     'play-clicks': { type: 'string' },
   },
@@ -46,6 +47,7 @@ if (!args.url) {
                     at 1179x2556. Keeps the aspect ratio, so nothing is cropped.
     --manual        You click manually in the browser, script only records
     --cursor        Show the mouse cursor (needed to aim in --manual mode)
+    --fit           Shrink the viewport so the whole window fits your screen
     --save-clicks   Save your manual clicks to a JSON file
     --play-clicks   Replay clicks from a JSON file instead of clicking
     --headless      Run without visible browser
@@ -66,7 +68,7 @@ if (!args.url) {
     iPhone 16 (393x852):  node record.js -u "..." -w 393 -h 852 -s 3
 
   Click small, render big — two passes:
-    1) node record.js -u "..." -w 393 -h 852 -s 1 --manual --cursor --save-clicks c.json
+    1) node record.js -u "..." -w 393 -h 852 --fit --manual --cursor --save-clicks c.json
     2) node record.js -u "..." -w 393 -h 852 -s 3 --headless --play-clicks c.json
     node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
   `);
@@ -144,8 +146,14 @@ const isManual = args.manual;
 // does not raise it. So --scale enlarges the viewport instead: Figma renders
 // its canvas at the higher zoom, which is a genuine resolution increase. The
 // aspect ratio is preserved, so scaling=contain still fills it exactly.
-const vw = Math.round(width * scale);
-const vh = Math.round(height * scale);
+// VP8/yuv420p needs even dimensions — an odd one gets silently shaved by the
+// encoder, so round to even here and keep the viewport and video identical.
+const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+
+// Filled in below, after --fit has had a chance to measure the screen.
+let effectiveScale = scale;
+let vw = even(width * scale);
+let vh = even(height * scale);
 
 // Load the click track up front so a bad file fails before a browser is opened.
 let playClicks = [];
@@ -172,6 +180,29 @@ protoUrl.searchParams.set('hide-ui', '1');
 protoUrl.searchParams.set('hotspot-hints', '0');
 const finalUrl = protoUrl.toString();
 
+const browser = await chromium.launch({
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
+  headless: args.headless,
+  args: ['--no-sandbox'],
+});
+
+// --fit: shrink the viewport until the window fits the display, so you can
+// actually see the whole prototype while clicking. Measure with a throwaway
+// page, since the real context needs its viewport fixed up front.
+if (args.fit && !args.headless) {
+  const probe = await browser.newPage();
+  const screen = await probe.evaluate(() => ({
+    w: window.screen.availWidth,
+    h: window.screen.availHeight,
+  }));
+  await probe.close();
+  const CHROME_HEIGHT = 130; // tab strip + address bar + window frame
+  const room = Math.min(screen.w / width, (screen.h - CHROME_HEIGHT) / height);
+  effectiveScale = Math.max(0.1, Math.min(scale, Math.floor(room * 100) / 100));
+  vw = even(width * effectiveScale);
+  vh = even(height * effectiveScale);
+}
+
 console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
 const mode = playClicks.length ? `Replay (${playClicks.length} clicks from ${args['play-clicks']})`
@@ -180,20 +211,14 @@ const mode = playClicks.length ? `Replay (${playClicks.length} clicks from ${arg
 console.log(`Mode:      ${mode}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
-console.log(`Frame:     ${width}x${height} @${scale}x  (scaling=${args.scaling})`);
-console.log(`Recorded:  ${vw}x${vh}`);
+console.log(`Frame:     ${width}x${height} @${effectiveScale}x  (scaling=${args.scaling})`);
+console.log(`Recorded:  ${vw}x${vh}${args.fit && effectiveScale !== scale ? '  (shrunk by --fit)' : ''}`);
 if (patchError) {
   console.log(`Video:     25fps @1Mbps (Playwright default — patch skipped: ${patchError})`);
 } else {
   console.log(`Video:     ${fps}fps @${bitrate}Mbps`);
 }
 console.log();
-
-const browser = await chromium.launch({
-  executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
-  headless: args.headless,
-  args: ['--no-sandbox'],
-});
 
 const context = await browser.newContext({
   viewport: { width: vw, height: vh },
@@ -277,17 +302,23 @@ if (playClicks.length) {
 if (args['save-clicks']) {
   console.log(`Your clicks are being saved to ${args['save-clicks']}`);
 }
-console.log('Press Enter to stop and save at any time.\n');
+console.log(process.stdin.isTTY
+  ? 'Press Enter to stop and save at any time.\n'
+  : 'Stdin is not a terminal — Enter-to-stop is disabled.\n');
 
-// Listen for Enter key to manually stop
+// Listen for Enter key to manually stop. Only possible on a real terminal —
+// piped or redirected stdin has no raw mode.
 let manualStop = false;
-process.stdin.setRawMode(true);
-process.stdin.resume();
-process.stdin.on('data', (key) => {
-  if (key[0] === 13 || key[0] === 10 || key[0] === 3) {
-    manualStop = true;
-  }
-});
+const canReadKeys = process.stdin.isTTY;
+if (canReadKeys) {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('data', (key) => {
+    if (key[0] === 13 || key[0] === 10 || key[0] === 3) {
+      manualStop = true;
+    }
+  });
+}
 
 const detectIdle = !args.nodetect;
 let previousShot = detectIdle ? await page.screenshot({ type: 'jpeg', quality: 40 }) : null;
@@ -360,8 +391,10 @@ while (Date.now() - startTime < maxDuration) {
   }
 }
 
-process.stdin.setRawMode(false);
-process.stdin.pause();
+if (canReadKeys) {
+  process.stdin.setRawMode(false);
+  process.stdin.pause();
+}
 
 if (!stopReason) {
   stopReason = `Reached max duration (${args.maxdur}s)`;
