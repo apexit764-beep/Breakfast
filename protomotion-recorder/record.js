@@ -73,19 +73,6 @@ const browser = await chromium.launch({
   args: ['--no-sandbox'],
 });
 
-// --- Phase 1: Pre-load (no recording) to warm up cache ---
-console.log('Pre-loading prototype (warming up cache)...');
-const warmupContext = await browser.newContext({
-  viewport: { width, height },
-  deviceScaleFactor: scale,
-});
-const warmupPage = await warmupContext.newPage();
-await warmupPage.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
-await warmupPage.waitForTimeout(5000);
-await warmupContext.close();
-console.log('Pre-load done. Starting clean recording...\n');
-
-// --- Phase 2: Actual recording (from cache, no glitch) ---
 const context = await browser.newContext({
   viewport: { width, height },
   deviceScaleFactor: scale,
