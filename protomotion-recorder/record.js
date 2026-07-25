@@ -21,6 +21,8 @@ const { values: args } = parseArgs({
     bitrate:  { type: 'string',  default: '8' },
     scaling:  { type: 'string',  default: 'contain' },
     cursor:   { type: 'boolean', default: false },
+    'save-clicks': { type: 'string' },
+    'play-clicks': { type: 'string' },
   },
   strict: false,
 });
@@ -44,6 +46,8 @@ if (!args.url) {
                     at 1179x2556. Keeps the aspect ratio, so nothing is cropped.
     --manual        You click manually in the browser, script only records
     --cursor        Show the mouse cursor (needed to aim in --manual mode)
+    --save-clicks   Save your manual clicks to a JSON file
+    --play-clicks   Replay clicks from a JSON file instead of clicking
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
     --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
@@ -60,6 +64,10 @@ if (!args.url) {
 
   Mobile — set the viewport to the frame size so nothing is scaled or cropped:
     iPhone 16 (393x852):  node record.js -u "..." -w 393 -h 852 -s 3
+
+  Click small, render big — two passes:
+    1) node record.js -u "..." -w 393 -h 852 -s 1 --manual --cursor --save-clicks c.json
+    2) node record.js -u "..." -w 393 -h 852 -s 3 --headless --play-clicks c.json
     node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
   `);
   process.exit(0);
@@ -139,6 +147,24 @@ const isManual = args.manual;
 const vw = Math.round(width * scale);
 const vh = Math.round(height * scale);
 
+// Load the click track up front so a bad file fails before a browser is opened.
+let playClicks = [];
+if (args['play-clicks']) {
+  try {
+    playClicks = JSON.parse(fs.readFileSync(args['play-clicks'], 'utf8'));
+  } catch (err) {
+    console.error(`Cannot read click track "${args['play-clicks']}": ${err.message}`);
+    process.exit(1);
+  }
+  const valid = Array.isArray(playClicks) && playClicks.every(
+    (c) => c && [c.t, c.x, c.y].every(Number.isFinite));
+  if (!valid) {
+    console.error(`Click track "${args['play-clicks']}" must be an array of {t,x,y} numbers`);
+    process.exit(1);
+  }
+  playClicks.sort((a, b) => a.t - b.t);
+}
+
 // Force fit-width + hide UI
 const protoUrl = new URL(args.url);
 protoUrl.searchParams.set('scaling', args.scaling);
@@ -148,7 +174,10 @@ const finalUrl = protoUrl.toString();
 
 console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
-console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
+const mode = playClicks.length ? `Replay (${playClicks.length} clicks from ${args['play-clicks']})`
+  : isManual ? 'Manual (you click)'
+  : `Auto (clicks center every ${args.pause}s)`;
+console.log(`Mode:      ${mode}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
 console.log(`Frame:     ${width}x${height} @${scale}x  (scaling=${args.scaling})`);
@@ -175,6 +204,16 @@ const context = await browser.newContext({
     size: { width: vw, height: vh },
   },
 });
+
+// Clicks are stored as fractions of the viewport, so a pass recorded in a small
+// window replays identically in a large headless one. This is what lets you
+// click comfortably at -s 1 and still render at -s 3.
+const savedClicks = [];
+if (args['save-clicks']) {
+  await context.exposeBinding('__protoClick', (source, x, y) => {
+    savedClicks.push({ t: Date.now(), x, y });
+  });
+}
 
 const page = await context.newPage();
 
@@ -217,12 +256,26 @@ await page.evaluate((showCursor) => {
   document.head.appendChild(style);
 }, args.cursor);
 
+// Capture phase, so Figma's own canvas handlers cannot swallow the event first.
+if (args['save-clicks']) {
+  await page.evaluate(() => {
+    window.addEventListener('pointerdown', (e) => {
+      window.__protoClick(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
+    }, true);
+  });
+}
+
 await page.waitForTimeout(500);
 
-if (isManual) {
+if (playClicks.length) {
+  console.log(`Recording... (replaying ${playClicks.length} clicks from ${args['play-clicks']})`);
+} else if (isManual) {
   console.log('Recording... Click in the browser to interact with the prototype.');
 } else {
   console.log('Recording... (auto-clicking + auto-stop on idle)');
+}
+if (args['save-clicks']) {
+  console.log(`Your clicks are being saved to ${args['save-clicks']}`);
 }
 console.log('Press Enter to stop and save at any time.\n');
 
@@ -240,6 +293,7 @@ const detectIdle = !args.nodetect;
 let previousShot = detectIdle ? await page.screenshot({ type: 'jpeg', quality: 40 }) : null;
 let idleStart = null;
 let lastClickTime = 0;
+let nextClick = 0;
 let lastProbe = '';
 const startTime = Date.now();
 let stopReason = '';
@@ -253,7 +307,13 @@ while (Date.now() - startTime < maxDuration) {
 
   const now = Date.now();
 
-  if (!isManual && now - lastClickTime >= clickPause) {
+  if (playClicks.length) {
+    while (nextClick < playClicks.length && now - startTime >= playClicks[nextClick].t) {
+      const c = playClicks[nextClick];
+      await page.mouse.click(c.x * vw, c.y * vh);
+      nextClick++;
+    }
+  } else if (!isManual && now - lastClickTime >= clickPause) {
     await page.mouse.click(vw / 2, vh / 2);
     lastClickTime = now;
   }
@@ -290,7 +350,9 @@ while (Date.now() - startTime < maxDuration) {
     previousShot = currentShot;
   } else {
     if (!idleStart) idleStart = Date.now();
-    if (Date.now() - idleStart >= idleTimeout) {
+    // A replay can sit idle between two scripted clicks — that is not the end.
+    if (nextClick < playClicks.length) idleStart = null;
+    else if (Date.now() - idleStart >= idleTimeout) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       stopReason = `Prototype finished after ${elapsed}s`;
       break;
@@ -305,6 +367,16 @@ if (!stopReason) {
   stopReason = `Reached max duration (${args.maxdur}s)`;
 }
 console.log(stopReason);
+
+if (args['save-clicks']) {
+  const track = savedClicks.map((c) => ({
+    t: c.t - startTime,
+    x: Number(c.x.toFixed(5)),
+    y: Number(c.y.toFixed(5)),
+  })).filter((c) => c.t >= 0);
+  fs.writeFileSync(args['save-clicks'], JSON.stringify(track, null, 2));
+  console.log(`Saved ${track.length} clicks to ${path.resolve(args['save-clicks'])}`);
+}
 
 console.log('Saving video...');
 await context.close();
