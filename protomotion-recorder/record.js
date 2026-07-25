@@ -10,8 +10,8 @@ const { values: args } = parseArgs({
     maxdur:   { type: 'string',  short: 'm', default: '120' },
     idle:     { type: 'string',  short: 'i', default: '5' },
     pause:    { type: 'string',  short: 'p', default: '2' },
-    width:    { type: 'string',  short: 'w', default: '1920' },
-    height:   { type: 'string',  short: 'h', default: '1080' },
+    width:    { type: 'string',  short: 'w', default: '1536' },
+    height:   { type: 'string',  short: 'h', default: '864' },
     scale:    { type: 'string',  short: 's', default: '1' },
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
@@ -32,8 +32,8 @@ if (!args.url) {
     -m, --maxdur    Max recording duration in seconds (default: 120)
     -i, --idle      Stop after this many seconds of no change (default: 5)
     -p, --pause     Seconds to wait between auto-clicks (default: 2)
-    -w, --width     Viewport width (default: 1920)
-    -h, --height    Viewport height (default: 1080)
+    -w, --width     Viewport width (default: 1536)
+    -h, --height    Viewport height (default: 864)
     -s, --scale     Device scale factor (default: 1)
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
@@ -91,10 +91,20 @@ console.log('Loading prototype...');
 await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
 await page.waitForTimeout(5000);
 
-// Hide cursor
+// Hide cursor + lock canvas size to prevent zoom blink during transitions
 await page.evaluate(() => {
   const style = document.createElement('style');
-  style.textContent = '* { cursor: none !important; }';
+  style.textContent = `
+    * { cursor: none !important; }
+    canvas {
+      width: 100vw !important;
+      height: 100vh !important;
+      object-fit: contain !important;
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+    }
+  `;
   document.head.appendChild(style);
 });
 
