@@ -73,6 +73,19 @@ const browser = await chromium.launch({
   args: ['--no-sandbox'],
 });
 
+// --- Phase 1: Pre-load (no recording) to warm up cache ---
+console.log('Pre-loading prototype (warming up cache)...');
+const warmupContext = await browser.newContext({
+  viewport: { width, height },
+  deviceScaleFactor: scale,
+});
+const warmupPage = await warmupContext.newPage();
+await warmupPage.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
+await warmupPage.waitForTimeout(5000);
+await warmupContext.close();
+console.log('Pre-load done. Starting clean recording...\n');
+
+// --- Phase 2: Actual recording (from cache, no glitch) ---
 const context = await browser.newContext({
   viewport: { width, height },
   deviceScaleFactor: scale,
@@ -83,14 +96,15 @@ const context = await browser.newContext({
 });
 
 const page = await context.newPage();
-
-console.log('Opening prototype...');
 await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
-console.log('Waiting for prototype to load...');
-await page.waitForTimeout(5000);
+await page.waitForTimeout(3000);
 
-// Hide Figma toolbar/UI chrome for clean recording
+// Hide cursor + Figma toolbar
 await page.evaluate(() => {
+  const style = document.createElement('style');
+  style.textContent = '* { cursor: none !important; }';
+  document.head.appendChild(style);
+
   const selectors = [
     '[class*="toolbar"]',
     '[class*="Toolbar"]',
