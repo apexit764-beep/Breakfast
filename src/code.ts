@@ -407,6 +407,45 @@ interface PlannedLayer {
 }
 
 /**
+ * True when the node only looks right composited over what sits behind it —
+ * a background blur has nothing to blur once exported on its own, and blend
+ * modes and masks likewise read against the backdrop. Such a node has to stay
+ * baked into the frame image instead of becoming its own layer.
+ */
+function dependsOnBackdrop(node: SceneNode): boolean {
+  const n = node as Partial<BlendMixin & SceneNodeMixin> & {
+    isMask?: boolean;
+    blendMode?: string;
+  };
+
+  const effects = n.effects;
+  if (
+    Array.isArray(effects) &&
+    effects.some((e) => e.visible !== false && e.type === "BACKGROUND_BLUR")
+  ) {
+    return true;
+  }
+
+  if (n.isMask === true) return true;
+
+  const blend = n.blendMode;
+  return blend != null && blend !== "NORMAL" && blend !== "PASS_THROUGH";
+}
+
+/** Whether the node or anything beneath it needs the backdrop to render. */
+function subtreeDependsOnBackdrop(node: SceneNode, depth = 0): boolean {
+  if (dependsOnBackdrop(node)) return true;
+  if (depth >= MAX_LAYER_DEPTH + 1) return false;
+
+  const children = (node as Partial<ChildrenMixin>).children;
+  if (!Array.isArray(children)) return false;
+
+  return children.some(
+    (child) => child.visible && subtreeDependsOnBackdrop(child, depth + 1)
+  );
+}
+
+/**
  * Chooses which nodes animate independently. Descending past the top level is
  * what lets elements nested inside a card or group move on their own, which is
  * how Smart Animate behaves in Figma.
@@ -422,6 +461,9 @@ function planLayers(
 
   for (const child of container.children) {
     if (!child.visible || budget.left <= 0) continue;
+
+    // Leaving it unplanned keeps it in the frame image, where its backdrop is.
+    if (subtreeDependsOnBackdrop(child)) continue;
 
     const seen = nameCounts.get(child.name) || 0;
     nameCounts.set(child.name, seen + 1);
@@ -457,33 +499,45 @@ function planLayers(
   return planned;
 }
 
-/** Exports a node with its children hidden, restoring them afterwards. */
-async function exportWithoutChildren(
-  node: SceneNode & ChildrenMixin,
+/**
+ * Exports a node with the given descendants hidden, restoring them afterwards.
+ * Only nodes that became their own layer may be hidden: anything hidden here
+ * and absent from the layer list would disappear from the render entirely.
+ */
+async function exportWithNodesHidden(
+  node: SceneNode,
+  hide: ReadonlyArray<SceneNode>,
   scale: number
 ): Promise<Uint8Array> {
-  const children = node.children.filter((c) => c.visible);
-  const previous = children.map((c) => c.visible);
+  const targets = hide.filter((c) => c.visible);
   try {
-    for (const child of children) child.visible = false;
+    for (const target of targets) target.visible = false;
     return await node.exportAsync({
       format: "PNG",
       constraint: { type: "SCALE", value: scale },
     });
   } finally {
-    children.forEach((child, i) => {
-      child.visible = previous[i];
-    });
+    for (const target of targets) target.visible = true;
   }
+}
+
+/** Exports a node's own paint, hiding every child it owns. */
+function exportWithoutChildren(
+  node: SceneNode & ChildrenMixin,
+  scale: number
+): Promise<Uint8Array> {
+  return exportWithNodesHidden(node, node.children as SceneNode[], scale);
 }
 
 /**
  * Splits a frame into its background plus one image per animatable layer, so
  * the UI can move each piece independently the way Smart Animate does.
  *
- * Layers are hidden on the real node while backgrounds are exported and
+ * Layers are hidden on the real node while the background is exported and
  * restored immediately afterwards — Figma has no API to render a subtree
- * without them.
+ * without them. Every visible node has to end up in exactly one of the two
+ * halves: whatever is hidden for the background must come back as a layer,
+ * and whatever never became a layer must stay in the background.
  */
 async function decomposeFrame(
   node: FlowNode,
@@ -496,6 +550,7 @@ async function decomposeFrame(
   const origin = frameOrigin(node);
   const layers: LayerSpec[] = [];
   const layerImages: Uint8Array[] = [];
+  const promoted = new Set<SceneNode>();
 
   for (const item of planned) {
     const rect = layerRect(item.node, origin);
@@ -517,11 +572,18 @@ async function decomposeFrame(
       imageIndex: layerImages.length,
     });
     layerImages.push(image);
+    promoted.add(item.node);
   }
 
   if (layers.length === 0) return null;
 
-  const baseImage = await exportWithoutChildren(node, scale);
+  // planLayers only descends into nodes it promoted, so hiding the frame's own
+  // promoted children removes every layer and nothing else. Children left
+  // unplanned — backdrop-dependent ones, or any whose bounds we could not
+  // measure — stay painted in the background rather than disappearing.
+  const hide = node.children.filter((child) => promoted.has(child));
+  const baseImage = await exportWithNodesHidden(node, hide, scale);
+
   return { layers, layerImages, baseImage };
 }
 
