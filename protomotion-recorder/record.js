@@ -54,9 +54,11 @@ const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 const isManual = args.manual;
 
-// Force fit-screen scaling in the prototype URL
+// Force clean prototype view via URL params
 const protoUrl = new URL(args.url);
 protoUrl.searchParams.set('scaling', 'contain');
+protoUrl.searchParams.set('hide-ui', '1');
+protoUrl.searchParams.set('hotspot-hints', '0');
 const finalUrl = protoUrl.toString();
 
 console.log(`Recording: ${finalUrl}`);
@@ -86,23 +88,11 @@ const page = await context.newPage();
 await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
 await page.waitForTimeout(3000);
 
-// Hide cursor + Figma toolbar
+// Hide cursor
 await page.evaluate(() => {
   const style = document.createElement('style');
   style.textContent = '* { cursor: none !important; }';
   document.head.appendChild(style);
-
-  const selectors = [
-    '[class*="toolbar"]',
-    '[class*="Toolbar"]',
-    '[data-testid="prototype-toolbar"]',
-    '[class*="hotspot-hint"]',
-  ];
-  for (const sel of selectors) {
-    document.querySelectorAll(sel).forEach(el => {
-      el.style.display = 'none';
-    });
-  }
 });
 
 await page.waitForTimeout(500);
