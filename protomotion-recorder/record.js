@@ -56,7 +56,8 @@ const isManual = args.manual;
 
 // Force clean prototype view via URL params
 const protoUrl = new URL(args.url);
-protoUrl.searchParams.set('scaling', 'contain');
+protoUrl.searchParams.set('scaling', 'scale-down');
+protoUrl.searchParams.set('content-scaling', 'fixed');
 protoUrl.searchParams.set('hide-ui', '1');
 protoUrl.searchParams.set('hotspot-hints', '0');
 const finalUrl = protoUrl.toString();
