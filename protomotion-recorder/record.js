@@ -72,8 +72,9 @@ const context = await browser.newContext({
 const page = await context.newPage();
 
 console.log('Opening prototype...');
-await page.goto(args.url, { waitUntil: 'networkidle', timeout: 60_000 });
-await page.waitForTimeout(3000);
+await page.goto(args.url, { waitUntil: 'load', timeout: 60_000 });
+console.log('Waiting for prototype to load...');
+await page.waitForTimeout(5000);
 
 // Hide Figma toolbar/UI chrome for clean recording
 await page.evaluate(() => {
