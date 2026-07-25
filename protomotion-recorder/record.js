@@ -15,6 +15,7 @@ const { values: args } = parseArgs({
     scale:    { type: 'string',  short: 's', default: '1' },
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
+    debug:    { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -37,6 +38,7 @@ if (!args.url) {
     -s, --scale     Device scale factor (default: 1)
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
+    --debug         Print canvas size/zoom changes (to diagnose zoom blink)
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
@@ -130,6 +132,7 @@ process.stdin.on('data', (key) => {
 let previousShot = await page.screenshot({ type: 'png' });
 let idleStart = null;
 let lastClickTime = 0;
+let lastProbe = '';
 const startTime = Date.now();
 let stopReason = '';
 
@@ -148,6 +151,26 @@ while (Date.now() - startTime < maxDuration) {
   }
 
   await page.waitForTimeout(400);
+
+  if (args.debug) {
+    const probe = await page.evaluate(() => {
+      const c = document.querySelector('canvas');
+      if (!c) return null;
+      return {
+        buffer: `${c.width}x${c.height}`,
+        css: `${c.clientWidth}x${c.clientHeight}`,
+        transform: getComputedStyle(c).transform,
+        window: `${window.innerWidth}x${window.innerHeight}`,
+      };
+    });
+    if (probe) {
+      const line = `buffer=${probe.buffer} css=${probe.css} win=${probe.window} transform=${probe.transform}`;
+      if (line !== lastProbe) {
+        console.log(`[${((Date.now() - startTime) / 1000).toFixed(1)}s] ${line}`);
+        lastProbe = line;
+      }
+    }
+  }
 
   const currentShot = await page.screenshot({ type: 'png' });
   const changed = !previousShot.equals(currentShot);
