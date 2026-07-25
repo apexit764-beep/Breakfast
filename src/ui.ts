@@ -428,14 +428,28 @@ async function exportVideo(): Promise<void> {
     }
 
     const result = await sink.finish();
+
+    if (result.blob.size === 0) {
+      throw new Error(
+        "الترميز خلص بدون أي بيانات. جرّب جودة أقل أو صيغة WebM."
+      );
+    }
+
     downloadBlob(result.blob, `prototype-export.${result.extension}`);
 
     const sizeMB = (result.blob.size / (1024 * 1024)).toFixed(1);
-    const note = result.note ? `\n${result.note}` : "";
-    showStatus(
-      `تم التصدير بنجاح — ${result.format.toUpperCase()} · ${sizeMB} MB${note}`,
-      "success"
-    );
+    const lines = [
+      `تم التصدير بنجاح — ${result.format.toUpperCase()} · ${sizeMB} MB`,
+      `${scene.frames.length} شاشات · ${emitted} إطار · ` +
+        `${(emitted / fps).toFixed(1)} ثانية · ${sink.width}×${sink.height}`,
+    ];
+    // A short count means frames were skipped somewhere in the pipeline.
+    if (emitted < totalFrames) {
+      lines.push(`تحذير: تم ترميز ${emitted} إطار من أصل ${totalFrames}.`);
+    }
+    if (result.note) lines.push(result.note);
+
+    showStatus(lines.join("\n"), emitted < totalFrames ? "warn" : "success");
   } catch (e) {
     showStatus(
       `فشل التصدير:\n${e instanceof Error ? e.message : String(e)}`,

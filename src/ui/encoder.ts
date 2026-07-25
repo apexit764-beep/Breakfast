@@ -254,23 +254,53 @@ function createWebmSink(options: SinkOptions, fallbackNote: string | null): Fram
   recorder.start();
   const frameInterval = 1000 / fps;
 
+  // MediaRecorder timestamps by wall clock, so the gap between frames has to
+  // absorb the caller's drawing time instead of being added on top of it —
+  // sleeping a full interval per frame stretches the result by however long
+  // rendering took.
+  let deadline = performance.now();
+  let lateFrames = 0;
+  let frames = 0;
+
   return {
     width: source.width,
     height: source.height,
 
     async addFrame() {
       track.requestFrame();
-      await new Promise((resolve) => setTimeout(resolve, frameInterval));
+      frames++;
+
+      deadline += frameInterval;
+      const wait = deadline - performance.now();
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        return;
+      }
+
+      // Drawing outran the frame budget; the clock can't be rewound, so record
+      // the slip and restart from now rather than accumulating debt.
+      lateFrames++;
+      deadline = performance.now();
     },
 
     async finish() {
       recorder.stop();
       await stopped;
+
+      const notes: string[] = [];
+      if (fallbackNote) notes.push(fallbackNote);
+      if (lateFrames > frames * 0.2) {
+        notes.push(
+          "الرسم كان أبطأ من سرعة التشغيل المطلوبة، فطول الفيديو زاد شوي. " +
+            "جرّب جودة أقل أو 30 إطار/ثانية."
+        );
+      }
+
       return {
         blob: new Blob(chunks, { type: "video/webm" }),
         extension: "webm",
         format: "webm",
-        note: fallbackNote,
+        note: notes.length ? notes.join("\n") : null,
       };
     },
 
