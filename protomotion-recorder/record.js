@@ -11,6 +11,7 @@ const { values: args } = parseArgs({
     height:   { type: 'string',  short: 'h', default: '1080' },
     scale:    { type: 'string',  short: 's', default: '1' },
     cursor:   { type: 'boolean', short: 'c', default: true },
+    headless: { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -51,9 +52,12 @@ console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log();
 
 const browser = await chromium.launch({
-  executablePath: '/opt/pw-browsers/chromium',
-  headless: false,
-  args: args.cursor === false ? ['--cursor=none'] : [],
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
+  headless: args.headless,
+  args: [
+    '--no-sandbox',
+    ...(args.cursor === false ? ['--cursor=none'] : []),
+  ],
 });
 
 const context = await browser.newContext({
