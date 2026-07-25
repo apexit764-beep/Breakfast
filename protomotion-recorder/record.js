@@ -8,6 +8,7 @@ const { values: args } = parseArgs({
     output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
     maxdur:   { type: 'string',  short: 'm', default: '120' },
     idle:     { type: 'string',  short: 'i', default: '5' },
+    pause:    { type: 'string',  short: 'p', default: '2' },
     width:    { type: 'string',  short: 'w', default: '1920' },
     height:   { type: 'string',  short: 'h', default: '1080' },
     scale:    { type: 'string',  short: 's', default: '1' },
@@ -27,7 +28,8 @@ if (!args.url) {
     -u, --url       Figma prototype URL (required)
     -o, --output    Output file path (default: prototype.webm)
     -m, --maxdur    Max recording duration in seconds (default: 120)
-    -i, --idle      Stop after this many seconds of no change (default: 3)
+    -i, --idle      Stop after this many seconds of no change (default: 5)
+    -p, --pause     Seconds to wait between auto-clicks (default: 2)
     -w, --width     Viewport width (default: 1920)
     -h, --height    Viewport height (default: 1080)
     -s, --scale     Device scale factor (default: 1)
@@ -35,7 +37,7 @@ if (!args.url) {
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
-    node record.js -u "https://figma.com/proto/..." -i 5 -w 1280 -h 720
+    node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
   `);
   process.exit(0);
 }
@@ -44,6 +46,7 @@ const width = parseInt(args.width);
 const height = parseInt(args.height);
 const maxDuration = parseInt(args.maxdur) * 1000;
 const idleTimeout = parseInt(args.idle) * 1000;
+const clickPause = parseInt(args.pause) * 1000;
 const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 
@@ -51,6 +54,7 @@ console.log(`Recording: ${args.url}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.idle}s of no change`);
+console.log(`Click every: ${args.pause}s`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log();
 
@@ -91,17 +95,23 @@ await page.evaluate(() => {
   }
 });
 
-// Click to start the prototype
-await page.mouse.click(width / 2, height / 2);
 await page.waitForTimeout(500);
-
-console.log('Recording... (auto-stops when prototype finishes)');
+console.log('Recording... (auto-clicking + auto-stop on idle)');
 
 let previousShot = await page.screenshot({ type: 'png' });
 let idleStart = null;
+let lastClickTime = 0;
 const startTime = Date.now();
 
 while (Date.now() - startTime < maxDuration) {
+  const now = Date.now();
+
+  // Auto-click at center every `clickPause` ms
+  if (now - lastClickTime >= clickPause) {
+    await page.mouse.click(width / 2, height / 2);
+    lastClickTime = now;
+  }
+
   await page.waitForTimeout(400);
 
   const currentShot = await page.screenshot({ type: 'png' });
@@ -114,7 +124,7 @@ while (Date.now() - startTime < maxDuration) {
     if (!idleStart) idleStart = Date.now();
     if (Date.now() - idleStart >= idleTimeout) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`Prototype stopped after ${elapsed}s`);
+      console.log(`Prototype finished after ${elapsed}s`);
       break;
     }
   }
