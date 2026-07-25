@@ -12,6 +12,7 @@ const { values: args } = parseArgs({
     width:    { type: 'string',  short: 'w', default: '1920' },
     height:   { type: 'string',  short: 'h', default: '1080' },
     scale:    { type: 'string',  short: 's', default: '1' },
+    manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
   },
   strict: false,
@@ -33,10 +34,12 @@ if (!args.url) {
     -w, --width     Viewport width (default: 1920)
     -h, --height    Viewport height (default: 1080)
     -s, --scale     Device scale factor (default: 1)
+    --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
+    node record.js -u "https://figma.com/proto/..." --manual
     node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
   `);
   process.exit(0);
@@ -49,6 +52,7 @@ const idleTimeout = parseInt(args.idle) * 1000;
 const clickPause = parseInt(args.pause) * 1000;
 const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
+const isManual = args.manual;
 
 // Force fit-screen scaling in the prototype URL
 const protoUrl = new URL(args.url);
@@ -57,9 +61,9 @@ const finalUrl = protoUrl.toString();
 
 console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
+console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.idle}s of no change`);
-console.log(`Click every: ${args.pause}s`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log();
 
@@ -101,7 +105,12 @@ await page.evaluate(() => {
 });
 
 await page.waitForTimeout(500);
-console.log('Recording... (auto-clicking + auto-stop on idle)');
+
+if (isManual) {
+  console.log('Recording... Click in the browser to interact with the prototype.');
+} else {
+  console.log('Recording... (auto-clicking + auto-stop on idle)');
+}
 console.log('Press Enter to stop and save at any time.\n');
 
 // Listen for Enter key to manually stop
@@ -129,8 +138,8 @@ while (Date.now() - startTime < maxDuration) {
 
   const now = Date.now();
 
-  // Auto-click at center every `clickPause` ms
-  if (now - lastClickTime >= clickPause) {
+  // Auto-click only in auto mode
+  if (!isManual && now - lastClickTime >= clickPause) {
     await page.mouse.click(width / 2, height / 2);
     lastClickTime = now;
   }
