@@ -7,7 +7,7 @@ const { values: args } = parseArgs({
     url:      { type: 'string',  short: 'u' },
     output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
     maxdur:   { type: 'string',  short: 'm', default: '120' },
-    idle:     { type: 'string',  short: 'i', default: '3' },
+    idle:     { type: 'string',  short: 'i', default: '5' },
     width:    { type: 'string',  short: 'w', default: '1920' },
     height:   { type: 'string',  short: 'h', default: '1080' },
     scale:    { type: 'string',  short: 's', default: '1' },
