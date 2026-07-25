@@ -102,13 +102,31 @@ await page.evaluate(() => {
 
 await page.waitForTimeout(500);
 console.log('Recording... (auto-clicking + auto-stop on idle)');
+console.log('Press Enter to stop and save at any time.\n');
+
+// Listen for Enter key to manually stop
+let manualStop = false;
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdin.on('data', (key) => {
+  if (key[0] === 13 || key[0] === 10 || key[0] === 3) {
+    manualStop = true;
+  }
+});
 
 let previousShot = await page.screenshot({ type: 'png' });
 let idleStart = null;
 let lastClickTime = 0;
 const startTime = Date.now();
+let stopReason = '';
 
 while (Date.now() - startTime < maxDuration) {
+  if (manualStop) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    stopReason = `Stopped manually after ${elapsed}s`;
+    break;
+  }
+
   const now = Date.now();
 
   // Auto-click at center every `clickPause` ms
@@ -129,15 +147,19 @@ while (Date.now() - startTime < maxDuration) {
     if (!idleStart) idleStart = Date.now();
     if (Date.now() - idleStart >= idleTimeout) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`Prototype finished after ${elapsed}s`);
+      stopReason = `Prototype finished after ${elapsed}s`;
       break;
     }
   }
 }
 
-if (Date.now() - startTime >= maxDuration) {
-  console.log(`Reached max duration (${args.maxdur}s)`);
+process.stdin.setRawMode(false);
+process.stdin.pause();
+
+if (!stopReason) {
+  stopReason = `Reached max duration (${args.maxdur}s)`;
 }
+console.log(stopReason);
 
 console.log('Saving video...');
 await context.close();
