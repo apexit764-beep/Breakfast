@@ -20,6 +20,7 @@ const { values: args } = parseArgs({
     fps:      { type: 'string',  default: '60' },
     bitrate:  { type: 'string',  default: '8' },
     scaling:  { type: 'string',  default: 'contain' },
+    cursor:   { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -42,6 +43,7 @@ if (!args.url) {
     -s, --scale     Resolution multiplier (default: 1) — 393x852 -s 3 records
                     at 1179x2556. Keeps the aspect ratio, so nothing is cropped.
     --manual        You click manually in the browser, script only records
+    --cursor        Show the mouse cursor (needed to aim in --manual mode)
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
     --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
@@ -176,15 +178,33 @@ const context = await browser.newContext({
 
 const page = await context.newPage();
 
+// A viewport taller/wider than the display still records correctly, but the
+// window can only show the part that fits — which makes manual clicking blind.
+if (!args.headless) {
+  const screen = await page.evaluate(() => ({
+    w: window.screen.availWidth,
+    h: window.screen.availHeight,
+  }));
+  if (vw > screen.w || vh > screen.h) {
+    const fit = Math.min(screen.w / width, (screen.h - 120) / height);
+    console.log('');
+    console.log(`  !  Viewport ${vw}x${vh} is larger than your screen (${screen.w}x${screen.h}).`);
+    console.log('     The video will still be correct, but the browser window can only');
+    console.log('     show part of it — you will not be able to click accurately.');
+    console.log(`     For manual clicking use:  -s ${Math.max(1, Math.floor(fit * 10) / 10)}`);
+    console.log('');
+  }
+}
+
 console.log('Loading prototype...');
 await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
 await page.waitForTimeout(5000);
 
 // Hide cursor + lock canvas size to prevent zoom blink during transitions
-await page.evaluate(() => {
+await page.evaluate((showCursor) => {
   const style = document.createElement('style');
   style.textContent = `
-    * { cursor: none !important; }
+    ${showCursor ? '' : '* { cursor: none !important; }'}
     canvas {
       width: 100vw !important;
       height: 100vh !important;
@@ -195,7 +215,7 @@ await page.evaluate(() => {
     }
   `;
   document.head.appendChild(style);
-});
+}, args.cursor);
 
 await page.waitForTimeout(500);
 
