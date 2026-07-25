@@ -6,11 +6,11 @@ const { values: args } = parseArgs({
   options: {
     url:      { type: 'string',  short: 'u' },
     output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
-    duration: { type: 'string',  short: 'd', default: '15' },
+    maxdur:   { type: 'string',  short: 'm', default: '120' },
+    idle:     { type: 'string',  short: 'i', default: '3' },
     width:    { type: 'string',  short: 'w', default: '1920' },
     height:   { type: 'string',  short: 'h', default: '1080' },
     scale:    { type: 'string',  short: 's', default: '1' },
-    cursor:   { type: 'boolean', short: 'c', default: true },
     headless: { type: 'boolean', default: false },
   },
   strict: false,
@@ -26,38 +26,38 @@ if (!args.url) {
   Options:
     -u, --url       Figma prototype URL (required)
     -o, --output    Output file path (default: prototype.webm)
-    -d, --duration  Recording duration in seconds (default: 15)
+    -m, --maxdur    Max recording duration in seconds (default: 120)
+    -i, --idle      Stop after this many seconds of no change (default: 3)
     -w, --width     Viewport width (default: 1920)
     -h, --height    Viewport height (default: 1080)
     -s, --scale     Device scale factor (default: 1)
-    -c, --cursor    Show cursor (default: true)
+    --headless      Run without visible browser
 
   Examples:
-    node record.js -u "https://figma.com/proto/..." -d 20
-    node record.js -u "https://figma.com/proto/..." -o demo.webm -w 1280 -h 720
+    node record.js -u "https://figma.com/proto/..."
+    node record.js -u "https://figma.com/proto/..." -i 5 -w 1280 -h 720
   `);
   process.exit(0);
 }
 
 const width = parseInt(args.width);
 const height = parseInt(args.height);
-const duration = parseInt(args.duration) * 1000;
+const maxDuration = parseInt(args.maxdur) * 1000;
+const idleTimeout = parseInt(args.idle) * 1000;
 const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 
 console.log(`Recording: ${args.url}`);
 console.log(`Output:    ${outputPath}`);
-console.log(`Duration:  ${args.duration}s`);
+console.log(`Max:       ${args.maxdur}s`);
+console.log(`Idle stop: ${args.idle}s of no change`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log();
 
 const browser = await chromium.launch({
   executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
   headless: args.headless,
-  args: [
-    '--no-sandbox',
-    ...(args.cursor === false ? ['--cursor=none'] : []),
-  ],
+  args: ['--no-sandbox'],
 });
 
 const context = await browser.newContext({
@@ -73,8 +73,6 @@ const page = await context.newPage();
 
 console.log('Opening prototype...');
 await page.goto(args.url, { waitUntil: 'networkidle', timeout: 60_000 });
-
-// Wait for Figma prototype to fully load
 await page.waitForTimeout(3000);
 
 // Hide Figma toolbar/UI chrome for clean recording
@@ -92,17 +90,42 @@ await page.evaluate(() => {
   }
 });
 
-// Click to start the prototype if needed
+// Click to start the prototype
 await page.mouse.click(width / 2, height / 2);
 await page.waitForTimeout(500);
 
-console.log(`Recording for ${args.duration}s...`);
-await page.waitForTimeout(duration);
+console.log('Recording... (auto-stops when prototype finishes)');
 
-console.log('Stopping recording...');
+let previousShot = await page.screenshot({ type: 'png' });
+let idleStart = null;
+const startTime = Date.now();
+
+while (Date.now() - startTime < maxDuration) {
+  await page.waitForTimeout(400);
+
+  const currentShot = await page.screenshot({ type: 'png' });
+  const changed = !previousShot.equals(currentShot);
+
+  if (changed) {
+    idleStart = null;
+    previousShot = currentShot;
+  } else {
+    if (!idleStart) idleStart = Date.now();
+    if (Date.now() - idleStart >= idleTimeout) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`Prototype stopped after ${elapsed}s`);
+      break;
+    }
+  }
+}
+
+if (Date.now() - startTime >= maxDuration) {
+  console.log(`Reached max duration (${args.maxdur}s)`);
+}
+
+console.log('Saving video...');
 await context.close();
 
-// Playwright saves video with a random name — rename it
 const video = page.video();
 if (video) {
   const savedPath = await video.path();
