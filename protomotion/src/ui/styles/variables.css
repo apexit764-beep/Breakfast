@@ -1,0 +1,53 @@
+:root {
+  /* Figma dark theme colors */
+  --color-bg: #2c2c2c;
+  --color-bg-secondary: #383838;
+  --color-bg-tertiary: #444444;
+  --color-bg-hover: #4a4a4a;
+  --color-bg-selected: #0d99ff;
+
+  --color-text: #ffffff;
+  --color-text-secondary: #b3b3b3;
+  --color-text-tertiary: #8c8c8c;
+  --color-text-on-primary: #ffffff;
+
+  --color-primary: #0d99ff;
+  --color-primary-hover: #0b87e0;
+  --color-primary-active: #0a76c4;
+
+  --color-danger: #f24822;
+  --color-success: #14ae5c;
+  --color-warning: #ffcd29;
+
+  --color-border: #4a4a4a;
+  --color-border-strong: #5c5c5c;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-full: 9999px;
+
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 12px;
+  --spacing-lg: 16px;
+  --spacing-xl: 24px;
+  --spacing-2xl: 32px;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 14px;
+  --font-size-xl: 18px;
+  --font-size-2xl: 24px;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --transition-fast: 100ms ease;
+  --transition-normal: 200ms ease;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.4);
+}

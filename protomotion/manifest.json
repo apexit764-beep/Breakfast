@@ -1,0 +1,16 @@
+{
+  "name": "ProtoMotion",
+  "id": "protomotion-figma-plugin",
+  "api": "1.0.0",
+  "main": "dist/plugin/main.js",
+  "ui": "dist/ui/index.html",
+  "editorType": ["figma"],
+  "containsWidget": false,
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "reasoning": "ProtoMotion processes all prototype data locally within the plugin sandbox. Video encoding is handled by a companion desktop app via local communication."
+  },
+  "capabilities": [],
+  "permissions": []
+}
