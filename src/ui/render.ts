@@ -322,7 +322,16 @@ interface Step {
   transitionFrames: number;
 }
 
-function planSteps(scene: Scene, fps: number): Step[] {
+/**
+ * A non-finite fps silently collapses every frame count to NaN, which renders
+ * nothing at all rather than failing loudly, so it is clamped here.
+ */
+function safeFps(fps: number): number {
+  return Number.isFinite(fps) && fps > 0 ? fps : 60;
+}
+
+function planSteps(scene: Scene, rawFps: number): Step[] {
+  const fps = safeFps(rawFps);
   const steps: Step[] = [];
   const { frames, loopToIndex } = scene;
 
@@ -339,18 +348,17 @@ function planSteps(scene: Scene, fps: number): Step[] {
     const curve = transition ? buildEasing(transition.easing) : null;
 
     let transitionFrames = 0;
-    if (next && transition) {
+    if (next && transition && Number.isFinite(transition.duration)) {
       // Figma's duration is authoritative for every easing, springs included.
       transitionFrames = Math.max(Math.round(transition.duration * fps), 1);
     }
 
-    steps.push({
-      frame,
-      next,
-      curve,
-      holdFrames: Math.max(Math.round((frame.spec.holdDuration / 1000) * fps), 1),
-      transitionFrames,
-    });
+    const hold = frame.spec.holdDuration;
+    const holdFrames = Number.isFinite(hold)
+      ? Math.max(Math.round((hold / 1000) * fps), 1)
+      : fps;
+
+    steps.push({ frame, next, curve, holdFrames, transitionFrames });
   }
 
   return steps;

@@ -501,23 +501,71 @@ function setBusy(busy: boolean): void {
 
 // --- Settings ------------------------------------------------------------
 
+/**
+ * Assigning a value no option carries leaves a select with selectedIndex -1 and
+ * an empty value, which then parses to NaN. Stored settings outlive the option
+ * lists they came from, so unknown values snap to the closest one on offer.
+ */
+function setSelect(id: string, value: unknown, fallback: string | number): void {
+  const select = el<HTMLSelectElement>(id);
+  select.value = String(value);
+  if (select.selectedIndex >= 0) return;
+
+  const wanted = Number(value);
+  if (Number.isFinite(wanted)) {
+    let bestIndex = -1;
+    let bestDelta = Infinity;
+    for (let i = 0; i < select.options.length; i++) {
+      const option = Number(select.options[i].value);
+      if (!Number.isFinite(option)) continue;
+      const delta = Math.abs(option - wanted);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex >= 0) {
+      select.selectedIndex = bestIndex;
+      return;
+    }
+  }
+
+  select.value = String(fallback);
+  if (select.selectedIndex < 0) select.selectedIndex = 0;
+}
+
+/** Reads a select/input as a positive number, never NaN. */
+function numberFrom(id: string, fallback: number): number {
+  const value = parseInt(el<HTMLInputElement | HTMLSelectElement>(id).value, 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 function applySettings(): void {
-  el<HTMLSelectElement>("scale").value = String(settings.scale);
-  el<HTMLSelectElement>("fps").value = String(settings.fps);
-  el<HTMLSelectElement>("bitrate").value = String(settings.bitrate);
-  el<HTMLSelectElement>("format").value = settings.format;
-  el<HTMLSelectElement>("source").value = settings.source;
-  el<HTMLInputElement>("hold-duration").value = String(settings.fallbackHoldMs);
+  setSelect("scale", settings.scale, DEFAULT_SETTINGS.scale);
+  setSelect("fps", settings.fps, DEFAULT_SETTINGS.fps);
+  setSelect("bitrate", settings.bitrate, DEFAULT_SETTINGS.bitrate);
+  setSelect("format", settings.format, DEFAULT_SETTINGS.format);
+  setSelect("source", settings.source, DEFAULT_SETTINGS.source);
+  el<HTMLInputElement>("hold-duration").value = String(
+    Number.isFinite(settings.fallbackHoldMs) && settings.fallbackHoldMs > 0
+      ? settings.fallbackHoldMs
+      : DEFAULT_SETTINGS.fallbackHoldMs
+  );
 }
 
 function collectSettings(): PluginSettings {
+  const format = el<HTMLSelectElement>("format").value;
+  const source = el<HTMLSelectElement>("source").value;
   return {
-    scale: parseInt(el<HTMLSelectElement>("scale").value),
-    fps: parseInt(el<HTMLSelectElement>("fps").value),
-    bitrate: parseInt(el<HTMLSelectElement>("bitrate").value),
-    format: el<HTMLSelectElement>("format").value as "mp4" | "webm",
-    source: el<HTMLSelectElement>("source").value as PluginSettings["source"],
-    fallbackHoldMs: parseInt(el<HTMLInputElement>("hold-duration").value) || 1000,
+    scale: numberFrom("scale", DEFAULT_SETTINGS.scale),
+    fps: numberFrom("fps", DEFAULT_SETTINGS.fps),
+    bitrate: numberFrom("bitrate", DEFAULT_SETTINGS.bitrate),
+    format: format === "webm" ? "webm" : "mp4",
+    source:
+      source === "frames" || source === "variants"
+        ? (source as PluginSettings["source"])
+        : "auto",
+    fallbackHoldMs: numberFrom("hold-duration", DEFAULT_SETTINGS.fallbackHoldMs),
   };
 }
 
