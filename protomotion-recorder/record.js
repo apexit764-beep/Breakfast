@@ -19,6 +19,7 @@ const { values: args } = parseArgs({
     nodetect: { type: 'boolean', default: false },
     fps:      { type: 'string',  default: '60' },
     bitrate:  { type: 'string',  default: '8' },
+    scaling:  { type: 'string',  default: 'contain' },
   },
   strict: false,
 });
@@ -45,10 +46,17 @@ if (!args.url) {
     --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
     --fps           Video framerate (default: 60, Playwright's own default is 25)
     --bitrate       Video bitrate in Mbps (default: 8, Playwright's default is 1)
+    --scaling       Figma scaling mode (default: contain)
+                      contain           fit whole frame, never crops
+                      scale-down-width  fit width, crops tall frames
+                      min-zoom          actual size (100%)
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
     node record.js -u "https://figma.com/proto/..." --manual
+
+  Mobile — set the viewport to the frame size so nothing is scaled or cropped:
+    iPhone 16 (393x852):  node record.js -u "..." -w 393 -h 852 -s 3
     node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
   `);
   process.exit(0);
@@ -123,7 +131,7 @@ const isManual = args.manual;
 
 // Force fit-width + hide UI
 const protoUrl = new URL(args.url);
-protoUrl.searchParams.set('scaling', 'scale-down-width');
+protoUrl.searchParams.set('scaling', args.scaling);
 protoUrl.searchParams.set('hide-ui', '1');
 protoUrl.searchParams.set('hotspot-hints', '0');
 const finalUrl = protoUrl.toString();
@@ -133,7 +141,8 @@ console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
-console.log(`Viewport:  ${width}x${height} @${scale}x`);
+console.log(`Viewport:  ${width}x${height} @${scale}x  (scaling=${args.scaling})`);
+console.log(`Recorded:  ${Math.round(width * scale)}x${Math.round(height * scale)}`);
 if (patchError) {
   console.log(`Video:     25fps @1Mbps (Playwright default — patch skipped: ${patchError})`);
 } else {
@@ -152,7 +161,9 @@ const context = await browser.newContext({
   deviceScaleFactor: scale,
   recordVideo: {
     dir: path.dirname(outputPath),
-    size: { width, height },
+    // Record at the rendered resolution, not the CSS one, so --scale actually
+    // buys sharpness instead of being downsampled away.
+    size: { width: Math.round(width * scale), height: Math.round(height * scale) },
   },
 });
 
