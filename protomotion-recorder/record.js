@@ -56,7 +56,7 @@ const isManual = args.manual;
 
 // Force fit-screen scaling in the prototype URL
 const protoUrl = new URL(args.url);
-protoUrl.searchParams.set('scaling', 'scale-down-width');
+protoUrl.searchParams.set('scaling', 'contain');
 const finalUrl = protoUrl.toString();
 
 console.log(`Recording: ${finalUrl}`);
