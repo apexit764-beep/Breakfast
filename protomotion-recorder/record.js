@@ -58,6 +58,7 @@ const isManual = args.manual;
 
 // Build the Figma embed URL
 const protoUrl = new URL(args.url);
+protoUrl.searchParams.set('scaling', 'scale-down-width');
 protoUrl.searchParams.set('hide-ui', '1');
 protoUrl.searchParams.set('hotspot-hints', '0');
 const embedUrl = protoUrl.toString();
