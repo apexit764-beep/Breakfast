@@ -37,9 +37,10 @@ if (!args.url) {
     -m, --maxdur    Max recording duration in seconds (default: 120)
     -i, --idle      Stop after this many seconds of no change (default: 5)
     -p, --pause     Seconds to wait between auto-clicks (default: 2)
-    -w, --width     Viewport width (default: 1536)
-    -h, --height    Viewport height (default: 864)
-    -s, --scale     Device scale factor (default: 1)
+    -w, --width     Figma frame width (default: 1536)
+    -h, --height    Figma frame height (default: 864)
+    -s, --scale     Resolution multiplier (default: 1) — 393x852 -s 3 records
+                    at 1179x2556. Keeps the aspect ratio, so nothing is cropped.
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
@@ -129,6 +130,13 @@ const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 const isManual = args.manual;
 
+// Chromium's screencast captures at the CSS viewport size — deviceScaleFactor
+// does not raise it. So --scale enlarges the viewport instead: Figma renders
+// its canvas at the higher zoom, which is a genuine resolution increase. The
+// aspect ratio is preserved, so scaling=contain still fills it exactly.
+const vw = Math.round(width * scale);
+const vh = Math.round(height * scale);
+
 // Force fit-width + hide UI
 const protoUrl = new URL(args.url);
 protoUrl.searchParams.set('scaling', args.scaling);
@@ -141,8 +149,8 @@ console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s`);
 console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
-console.log(`Viewport:  ${width}x${height} @${scale}x  (scaling=${args.scaling})`);
-console.log(`Recorded:  ${Math.round(width * scale)}x${Math.round(height * scale)}`);
+console.log(`Frame:     ${width}x${height} @${scale}x  (scaling=${args.scaling})`);
+console.log(`Recorded:  ${vw}x${vh}`);
 if (patchError) {
   console.log(`Video:     25fps @1Mbps (Playwright default — patch skipped: ${patchError})`);
 } else {
@@ -157,13 +165,12 @@ const browser = await chromium.launch({
 });
 
 const context = await browser.newContext({
-  viewport: { width, height },
-  deviceScaleFactor: scale,
+  viewport: { width: vw, height: vh },
   recordVideo: {
     dir: path.dirname(outputPath),
-    // Record at the rendered resolution, not the CSS one, so --scale actually
-    // buys sharpness instead of being downsampled away.
-    size: { width: Math.round(width * scale), height: Math.round(height * scale) },
+    // Must match the viewport exactly — a larger size makes ffmpeg pad the
+    // frame with gray instead of producing a sharper picture.
+    size: { width: vw, height: vh },
   },
 });
 
@@ -227,7 +234,7 @@ while (Date.now() - startTime < maxDuration) {
   const now = Date.now();
 
   if (!isManual && now - lastClickTime >= clickPause) {
-    await page.mouse.click(width / 2, height / 2);
+    await page.mouse.click(vw / 2, vh / 2);
     lastClickTime = now;
   }
 
