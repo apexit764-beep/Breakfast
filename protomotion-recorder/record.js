@@ -1,6 +1,8 @@
 import { chromium } from '@playwright/test';
 import { parseArgs } from 'node:util';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 const { values: args } = parseArgs({
   options: {
@@ -54,15 +56,27 @@ const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
 const isManual = args.manual;
 
-// Force clean prototype view via URL params
+// Build the Figma embed URL
 const protoUrl = new URL(args.url);
-protoUrl.searchParams.set('scaling', 'scale-down');
-protoUrl.searchParams.set('content-scaling', 'fixed');
 protoUrl.searchParams.set('hide-ui', '1');
 protoUrl.searchParams.set('hotspot-hints', '0');
-const finalUrl = protoUrl.toString();
+const embedUrl = protoUrl.toString();
 
-console.log(`Recording: ${finalUrl}`);
+// Create a wrapper HTML page with fixed-size iframe
+const wrapperHtml = `<!DOCTYPE html>
+<html><head><style>
+  * { margin: 0; padding: 0; cursor: none !important; }
+  html, body { width: ${width}px; height: ${height}px; overflow: hidden; background: #000; }
+  iframe { width: ${width}px; height: ${height}px; border: none; }
+</style></head><body>
+  <iframe src="${embedUrl}" allow="fullscreen" allowfullscreen></iframe>
+</body></html>`;
+
+const tmpDir = os.tmpdir();
+const wrapperPath = path.join(tmpDir, `figma-recorder-${Date.now()}.html`);
+fs.writeFileSync(wrapperPath, wrapperHtml);
+
+console.log(`Recording: ${embedUrl}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s`);
@@ -86,17 +100,19 @@ const context = await browser.newContext({
 });
 
 const page = await context.newPage();
-await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
-await page.waitForTimeout(3000);
 
-// Hide cursor
-await page.evaluate(() => {
-  const style = document.createElement('style');
-  style.textContent = '* { cursor: none !important; }';
-  document.head.appendChild(style);
-});
+console.log('Loading prototype...');
+await page.goto(`file://${wrapperPath}`, { waitUntil: 'load', timeout: 60_000 });
 
-await page.waitForTimeout(500);
+// Wait for the iframe content (Figma prototype) to load
+const iframe = page.frameLocator('iframe');
+try {
+  await iframe.locator('canvas').waitFor({ state: 'visible', timeout: 30_000 });
+  console.log('Prototype canvas ready.');
+} catch {
+  console.log('Waiting extra time for prototype...');
+}
+await page.waitForTimeout(5000);
 
 if (isManual) {
   console.log('Recording... Click in the browser to interact with the prototype.');
@@ -130,7 +146,6 @@ while (Date.now() - startTime < maxDuration) {
 
   const now = Date.now();
 
-  // Auto-click only in auto mode
   if (!isManual && now - lastClickTime >= clickPause) {
     await page.mouse.click(width / 2, height / 2);
     lastClickTime = now;
@@ -168,9 +183,11 @@ await context.close();
 const video = page.video();
 if (video) {
   const savedPath = await video.path();
-  const fs = await import('node:fs');
   fs.renameSync(savedPath, outputPath);
 }
+
+// Cleanup temp file
+try { fs.unlinkSync(wrapperPath); } catch {}
 
 await browser.close();
 console.log(`Done! Video saved to: ${outputPath}`);
