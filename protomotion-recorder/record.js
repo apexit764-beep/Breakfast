@@ -20,6 +20,7 @@ const { values: args } = parseArgs({
     res:      { type: 'string',  short: 'r' },
     'design-width': { type: 'string', short: 'd' },
     fit:      { type: 'string',              default: 'width' },
+    upscale:  { type: 'boolean', default: false },
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
     debug:    { type: 'boolean', default: false },
@@ -58,6 +59,9 @@ if (!args.url) {
                       width  = fill the width, may crop top/bottom
                       screen = whole frame visible, background fills the rest
                       actual = no scaling
+    --upscale       With -d: record at the design size and let the encoder scale
+                    the video up. Keeps the frame rate high on big outputs, at
+                    the cost of some sharpness
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
     --debug         Print canvas size changes (to diagnose zoom blink)
@@ -188,26 +192,37 @@ if (!Number.isFinite(videoWidth) || !Number.isFinite(videoHeight) || videoWidth 
   die(`Invalid recording size (${videoWidth}x${videoHeight}). Check --width/--height/--aspect/--res.`);
 }
 
-// The browser window is exactly the output size: Playwright never scales a
-// frame UP, it pads it with background, so a video bigger than the window would
-// come out framed in grey.
-const width = videoWidth;
-const height = videoHeight;
-
 // Figma only ever scales a frame DOWN to fit the window, never up, so on a
 // window wider than the design the prototype sits at its own size surrounded by
-// the prototype background. --design-width fixes that: the page is rendered at
-// designWidth-times-higher density and the canvas is then blown up by the same
-// factor, so the design fills the frame at full sharpness.
+// the prototype background. --design-width fixes that in one of two ways:
+//   default    render at designWidth-times-higher density and blow the canvas up
+//              by the same factor - sharp, but a lot of pixels to paint
+//   --upscale  record a window the size of the design and let ffmpeg scale the
+//              finished frames up - softer, but the frame rate stays high
 const designWidth = args['design-width'] !== undefined ? parseInt(args['design-width']) : null;
 if (designWidth !== null && (!Number.isFinite(designWidth) || designWidth < 2)) {
   die(`Invalid --design-width "${args['design-width']}". Use the frame width from Figma, e.g. 1920.`);
 }
 
-const fillScale = designWidth !== null ? videoWidth / designWidth : 1;
-if (fillScale < 1) {
+const ratioOfOutput = videoHeight / videoWidth;
+const fitScale = designWidth !== null ? videoWidth / designWidth : 1;
+if (fitScale < 1) {
   die(`--design-width ${designWidth} is wider than the video (${videoWidth}px). Figma scales down on its own here, so drop --design-width.`);
 }
+
+if (args.upscale && designWidth === null) {
+  die('--upscale needs --design-width so it knows what size to record at, e.g. -d 1920.');
+}
+if (args.upscale && !ffmpeg.canFilter) {
+  die(`The ffmpeg at ${ffmpeg.path} has no scale filter, so --upscale cannot work. Run "npm install" in this folder to get a full build.`);
+}
+
+// The window is the output size, except with --upscale where it is the design
+// size. It is never bigger than the output: the encoder scales frames, so a
+// window bigger than the video would just throw pixels away.
+const width = args.upscale ? even(designWidth) : videoWidth;
+const height = args.upscale ? even(designWidth * ratioOfOutput) : videoHeight;
+const fillScale = args.upscale ? 1 : fitScale;
 
 const deviceScaleFactor = fillScale * scale;
 if (deviceScaleFactor > 4) {
@@ -246,7 +261,11 @@ console.log(`Stop:      press Enter`);
 const trim = (n) => String(Number(n.toFixed(3)));
 console.log(`Video:     ${videoWidth}x${videoHeight}  aspect ${ratioLabel(videoWidth, videoHeight)}   (from ${sizeSource})`);
 console.log(`Window:    ${width}x${height} @${trim(deviceScaleFactor)}x density`);
-console.log(`Design:    ${designWidth !== null ? `${designWidth}px wide -> scaled up x${trim(fillScale)} to fill the frame` : 'not set (Figma will not scale the frame up; add -d if you see grey borders)'}`);
+console.log(`Design:    ${designWidth === null
+  ? 'not set (Figma will not scale the frame up; add -d if you see grey borders)'
+  : args.upscale
+    ? `${designWidth}px wide -> recorded 1:1, then upscaled x${trim(videoWidth / width)} on encode (smoother, slightly softer)`
+    : `${designWidth}px wide -> rendered at x${trim(fillScale)} density to fill the frame (sharpest)`}`);
 console.log(`Format:    ${isMp4 ? 'mp4 / H.264' : ffmpeg.canVp9 ? 'webm / VP9' : 'webm / VP8'} @${fps}fps, crf ${crf}`);
 console.log(`Fit:       ${fitKey} (scaling=${FIT_MODES[fitKey]})`);
 console.log();
@@ -307,7 +326,7 @@ const ffmpegArgs = [
   '-framerate', String(fps),
   '-i', '-',
 ];
-if (ffmpeg.canFilter) ffmpegArgs.push('-vf', `scale=${videoWidth}:${videoHeight}`);
+if (ffmpeg.canFilter) ffmpegArgs.push('-vf', `scale=${videoWidth}:${videoHeight}:flags=lanczos`);
 ffmpegArgs.push('-r', String(fps));
 if (isMp4) {
   ffmpegArgs.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(crf),
