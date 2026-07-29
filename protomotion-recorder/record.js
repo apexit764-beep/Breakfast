@@ -1,12 +1,16 @@
 import { chromium } from '@playwright/test';
 import { parseArgs } from 'node:util';
+import { spawn, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import fs from 'node:fs';
 
 const { values: args } = parseArgs({
   options: {
     url:      { type: 'string',  short: 'u' },
-    output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
+    output:   { type: 'string',  short: 'o', default: 'prototype.mp4' },
+    fps:      { type: 'string',              default: '60' },
+    quality:  { type: 'string',  short: 'q', default: '18' },
     maxdur:   { type: 'string',  short: 'm', default: '600' },
     pause:    { type: 'string',  short: 'p', default: '2' },
     width:    { type: 'string',  short: 'w', default: '1536' },
@@ -32,7 +36,9 @@ if (!args.url) {
 
   Options:
     -u, --url       Figma prototype URL (required)
-    -o, --output    Output file path (default: prototype.webm)
+    -o, --output    Output file path; .mp4 or .webm (default: prototype.mp4)
+    --fps           Frames per second (default: 60)
+    -q, --quality   CRF quality, lower = better/bigger (default: 18)
     -m, --maxdur    Safety cap on recording length in seconds (default: 600)
     -p, --pause     Seconds to wait between auto-clicks (default: 2)
     -w, --width     Recording width (default: 1536)
@@ -82,6 +88,67 @@ const die = (message) => {
 
 if (!Number.isFinite(scale) || scale <= 0) {
   die(`Invalid --scale "${args.scale}". Use a positive number, e.g. 1, 1.5 or 2.`);
+}
+
+const fps = parseInt(args.fps);
+if (!Number.isFinite(fps) || fps < 1 || fps > 120) {
+  die(`Invalid --fps "${args.fps}". Use a number between 1 and 120, e.g. 60.`);
+}
+
+const crf = parseInt(args.quality);
+if (!Number.isFinite(crf) || crf < 0 || crf > 63) {
+  die(`Invalid --quality "${args.quality}". Use a CRF between 0 (huge) and 63 (tiny); 18 is a good default.`);
+}
+
+const outputExt = path.extname(outputPath).toLowerCase();
+if (!['.mp4', '.webm'].includes(outputExt)) {
+  die(`Unsupported output "${path.basename(outputPath)}". Use a .mp4 or .webm file name.`);
+}
+const isMp4 = outputExt === '.mp4';
+
+// ffmpeg does the encoding. Prefer a full build (H.264 + mp4); the one bundled
+// with Playwright is VP8/webm only, so it is the last resort.
+function resolveFfmpeg() {
+  const works = (candidate) => {
+    if (!candidate) return null;
+    const probe = spawnSync(candidate, ['-hide_banner', '-encoders'], { encoding: 'utf8' });
+    if (probe.error || probe.status !== 0) return null;
+    const out = probe.stdout || '';
+    return {
+      path: candidate,
+      canH264: /libx264/.test(out),
+      canVp9: /libvpx-vp9/.test(out),
+      canFilter: !/^$/.test(out), // full builds ship filters; verified below
+    };
+  };
+
+  const candidates = [];
+  if (process.env.FFMPEG_PATH) candidates.push(process.env.FFMPEG_PATH);
+  try {
+    const required = createRequire(import.meta.url)('ffmpeg-static');
+    if (required) candidates.push(required.default || required);
+  } catch {
+    // optional dependency not installed
+  }
+  candidates.push('ffmpeg');
+
+  for (const candidate of candidates) {
+    const found = works(candidate);
+    if (found) {
+      const filters = spawnSync(found.path, ['-hide_banner', '-filters'], { encoding: 'utf8' });
+      found.canFilter = /(^|\s)scale(\s|$)/m.test(filters.stdout || '');
+      return found;
+    }
+  }
+  return null;
+}
+
+const ffmpeg = resolveFfmpeg();
+if (!ffmpeg) {
+  die('No ffmpeg found. Run "npm install" in this folder (it installs one), or install ffmpeg and put it on your PATH.');
+}
+if (isMp4 && !ffmpeg.canH264) {
+  die(`The ffmpeg found at ${ffmpeg.path} cannot write mp4 (no libx264).\nRun "npm install" in this folder to get a full build, or record to .webm instead.`);
 }
 
 // Video encoders are happiest with even dimensions.
@@ -180,22 +247,19 @@ const trim = (n) => String(Number(n.toFixed(3)));
 console.log(`Video:     ${videoWidth}x${videoHeight}  aspect ${ratioLabel(videoWidth, videoHeight)}   (from ${sizeSource})`);
 console.log(`Window:    ${width}x${height} @${trim(deviceScaleFactor)}x density`);
 console.log(`Design:    ${designWidth !== null ? `${designWidth}px wide -> scaled up x${trim(fillScale)} to fill the frame` : 'not set (Figma will not scale the frame up; add -d if you see grey borders)'}`);
+console.log(`Format:    ${isMp4 ? 'mp4 / H.264' : ffmpeg.canVp9 ? 'webm / VP9' : 'webm / VP8'} @${fps}fps, crf ${crf}`);
 console.log(`Fit:       ${fitKey} (scaling=${FIT_MODES[fitKey]})`);
 console.log();
 
 const browser = await chromium.launch({
   executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
   headless: args.headless,
-  args: ['--no-sandbox'],
+  args: ['--no-sandbox', '--disable-gpu-vsync', '--disable-frame-rate-limit'],
 });
 
 const context = await browser.newContext({
   viewport: { width, height },
   deviceScaleFactor,
-  recordVideo: {
-    dir: path.dirname(outputPath),
-    size: { width: videoWidth, height: videoHeight },
-  },
 });
 
 const page = await context.newPage();
@@ -233,6 +297,74 @@ await page.waitForTimeout(500);
 const clickX = width / 2;
 const clickY = height / 2;
 
+// ---- Recording engine -------------------------------------------------------
+// Playwright's own recorder is locked to 25 fps / 1 Mbps webm, so we drive the
+// capture ourselves: Chromium streams JPEG frames over CDP and we pipe them into
+// ffmpeg at the requested frame rate.
+const ffmpegArgs = [
+  '-y',
+  '-f', 'image2pipe',
+  '-framerate', String(fps),
+  '-i', '-',
+];
+if (ffmpeg.canFilter) ffmpegArgs.push('-vf', `scale=${videoWidth}:${videoHeight}`);
+ffmpegArgs.push('-r', String(fps));
+if (isMp4) {
+  ffmpegArgs.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(crf),
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
+} else if (ffmpeg.canVp9) {
+  ffmpegArgs.push('-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0',
+    '-deadline', 'realtime', '-cpu-used', '4', '-pix_fmt', 'yuv420p');
+} else {
+  ffmpegArgs.push('-c:v', 'libvpx', '-crf', String(crf), '-b:v', '12M',
+    '-deadline', 'realtime', '-speed', '8');
+}
+ffmpegArgs.push(outputPath);
+
+const encoder = spawn(ffmpeg.path, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+let encoderError = '';
+encoder.stderr.on('data', (chunk) => { encoderError += chunk.toString(); });
+encoder.stdin.on('error', () => {});
+const encoderExit = new Promise((resolve) => encoder.on('close', resolve));
+
+const cdp = await context.newCDPSession(page);
+let latestFrame = null;
+let capturedFrames = 0;
+
+cdp.on('Page.screencastFrame', async (frame) => {
+  latestFrame = Buffer.from(frame.data, 'base64');
+  capturedFrames++;
+  try {
+    await cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId });
+  } catch {
+    // page closed mid-stream
+  }
+});
+
+await cdp.send('Page.startScreencast', {
+  format: 'jpeg',
+  quality: 92,
+  maxWidth: videoWidth,
+  maxHeight: videoHeight,
+  everyNthFrame: 1,
+});
+
+// Constant frame rate: on every tick, top the pipe up to the frame index the
+// wall clock says we should be at, repeating the last frame when the page has
+// not painted anything new. Repeats reuse the same buffer, so they are free.
+let writtenFrames = 0;
+let recordingStart = 0;
+const pump = () => {
+  if (!recordingStart || !latestFrame || encoder.stdin.destroyed) return;
+  const target = Math.floor(((Date.now() - recordingStart) / 1000) * fps);
+  let budget = Math.ceil(fps / 4); // catch up gradually, never in a huge burst
+  while (writtenFrames < target && budget-- > 0) {
+    encoder.stdin.write(latestFrame);
+    writtenFrames++;
+  }
+};
+const pumpTimer = setInterval(pump, Math.max(4, Math.floor(500 / fps)));
+
 if (isManual) {
   console.log('Recording... Click in the browser to interact with the prototype.');
 } else {
@@ -253,6 +385,7 @@ process.stdin.on('data', (key) => {
 let lastClickTime = 0;
 let lastProbe = '';
 const startTime = Date.now();
+recordingStart = startTime;
 let stopReason = '';
 
 while (Date.now() - startTime < maxDuration) {
@@ -301,14 +434,32 @@ if (!stopReason) {
 }
 console.log(stopReason);
 
-console.log('Saving video...');
-await context.close();
-
-const video = page.video();
-if (video) {
-  const savedPath = await video.path();
-  fs.renameSync(savedPath, outputPath);
+const recordedSeconds = (Date.now() - recordingStart) / 1000;
+pump();
+clearInterval(pumpTimer);
+try {
+  await cdp.send('Page.stopScreencast');
+} catch {
+  // page already gone
 }
 
+console.log('Encoding video...');
+encoder.stdin.end();
+const encoderCode = await encoderExit;
+
 await browser.close();
-console.log(`Done! Video saved to: ${outputPath}`);
+
+if (encoderCode !== 0 || !fs.existsSync(outputPath)) {
+  console.error(`ffmpeg failed (exit ${encoderCode}):`);
+  console.error(encoderError.split('\n').slice(-12).join('\n'));
+  process.exit(1);
+}
+
+const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
+const capturedFps = (capturedFrames / recordedSeconds).toFixed(1);
+console.log(`Done! Video saved to: ${outputPath}  (${sizeMb} MB)`);
+console.log(`Frames:    ${fps} fps in the file; Chromium painted ${capturedFps} new frames/s during the recording`);
+if (Number(capturedFps) < fps * 0.75) {
+  console.log(`           Lower than ${fps} — the browser could not paint that fast at this size.`);
+  console.log(`           Try a smaller -w, or -s 1, or close heavy apps.`);
+}
