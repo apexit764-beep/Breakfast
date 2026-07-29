@@ -7,8 +7,7 @@ const { values: args } = parseArgs({
   options: {
     url:      { type: 'string',  short: 'u' },
     output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
-    maxdur:   { type: 'string',  short: 'm', default: '120' },
-    idle:     { type: 'string',  short: 'i', default: '5' },
+    maxdur:   { type: 'string',  short: 'm', default: '600' },
     pause:    { type: 'string',  short: 'p', default: '2' },
     width:    { type: 'string',  short: 'w', default: '1536' },
     height:   { type: 'string',  short: 'h', default: '864' },
@@ -18,7 +17,6 @@ const { values: args } = parseArgs({
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
     debug:    { type: 'boolean', default: false },
-    nodetect: { type: 'boolean', default: false },
   },
   strict: false,
 });
@@ -33,8 +31,7 @@ if (!args.url) {
   Options:
     -u, --url       Figma prototype URL (required)
     -o, --output    Output file path (default: prototype.webm)
-    -m, --maxdur    Max recording duration in seconds (default: 120)
-    -i, --idle      Stop after this many seconds of no change (default: 5)
+    -m, --maxdur    Safety cap on recording length in seconds (default: 600)
     -p, --pause     Seconds to wait between auto-clicks (default: 2)
     -w, --width     Viewport width (default: 1536)
     -h, --height    Viewport height (default: 864)
@@ -46,7 +43,8 @@ if (!args.url) {
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
     --debug         Print canvas size/zoom changes (to diagnose zoom blink)
-    --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
+
+  Recording stops when you press Enter (or when --maxdur is reached).
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
@@ -61,7 +59,6 @@ if (!args.url) {
 const width = parseInt(args.width);
 const height = parseInt(args.height);
 const maxDuration = parseInt(args.maxdur) * 1000;
-const idleTimeout = parseInt(args.idle) * 1000;
 const clickPause = parseInt(args.pause) * 1000;
 const scale = parseFloat(args.scale);
 const outputPath = path.resolve(args.output);
@@ -111,8 +108,8 @@ const finalUrl = protoUrl.toString();
 console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
-console.log(`Max:       ${args.maxdur}s`);
-console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
+console.log(`Max:       ${args.maxdur}s (safety cap)`);
+console.log(`Stop:      press Enter`);
 console.log(`Viewport:  ${width}x${height} @${scale}x`);
 console.log(`Zoom:      ${zoom === 1 ? 'off (1x)' : `${zoom}x on ${focusKey in FOCUS_PRESETS ? focusKey : zoomOrigin} (render @${deviceScaleFactor}x)`}`);
 console.log();
@@ -185,7 +182,7 @@ if (!isManual && zoom !== 1) {
 if (isManual) {
   console.log('Recording... Click in the browser to interact with the prototype.');
 } else {
-  console.log('Recording... (auto-clicking + auto-stop on idle)');
+  console.log(`Recording... (auto-clicking every ${args.pause}s)`);
 }
 console.log('Press Enter to stop and save at any time.\n');
 
@@ -199,12 +196,6 @@ process.stdin.on('data', (key) => {
   }
 });
 
-const detectIdle = !args.nodetect;
-// scale: 'css' keeps idle-detection screenshots viewport-sized even when the
-// page renders at a higher device scale factor because of --zoom.
-const shotOptions = { type: 'png', scale: 'css' };
-let previousShot = detectIdle ? await page.screenshot(shotOptions) : null;
-let idleStart = null;
 let lastClickTime = 0;
 let lastProbe = '';
 const startTime = Date.now();
@@ -244,23 +235,6 @@ while (Date.now() - startTime < maxDuration) {
         console.log(`[${((Date.now() - startTime) / 1000).toFixed(1)}s] ${line}`);
         lastProbe = line;
       }
-    }
-  }
-
-  if (!detectIdle) continue;
-
-  const currentShot = await page.screenshot(shotOptions);
-  const changed = !previousShot.equals(currentShot);
-
-  if (changed) {
-    idleStart = null;
-    previousShot = currentShot;
-  } else {
-    if (!idleStart) idleStart = Date.now();
-    if (Date.now() - idleStart >= idleTimeout) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      stopReason = `Prototype finished after ${elapsed}s`;
-      break;
     }
   }
 }
