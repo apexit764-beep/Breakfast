@@ -14,6 +14,7 @@ const { values: args } = parseArgs({
     scale:    { type: 'string',  short: 's', default: '1' },
     aspect:   { type: 'string',  short: 'a' },
     res:      { type: 'string',  short: 'r' },
+    'design-width': { type: 'string', short: 'd' },
     fit:      { type: 'string',              default: 'width' },
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
@@ -39,7 +40,14 @@ if (!args.url) {
     -a, --aspect    Aspect ratio of the video, e.g. 16:9, 4:5, 1.91:1 or 1.78.
                     Height is derived from --width, whatever the frame size in Figma
     -r, --res       Exact size instead of a ratio, e.g. 2880x1838
-    -s, --scale     Render density; multiplies the final resolution (default: 1)
+    -d, --design-width
+                    Frame width in Figma, e.g. 1920. Use this whenever the video
+                    is bigger than the design: Figma never scales a frame UP, so
+                    without it you get the design at its own size on a grey
+                    background. With it the window stays at the design width and
+                    the pixel density is raised instead (no grey, full sharpness)
+    -s, --scale     Extra render density for smoother edges (default: 1).
+                    Does not change the file resolution
     --fit           How the Figma frame fits the shape (default: width)
                       width  = fill the width, may crop top/bottom
                       screen = whole frame visible, background fills the rest
@@ -49,15 +57,14 @@ if (!args.url) {
     --debug         Print canvas size changes (to diagnose zoom blink)
 
   Recording stops when you press Enter (or when --maxdur is reached).
-  Final video resolution = width x height x scale.
+  Video resolution = width x height (exactly what you ask for).
 
   Examples:
     node record.js -u "https://figma.com/proto/..."
     node record.js -u "https://figma.com/proto/..." --manual
-    node record.js -u "https://figma.com/proto/..." -a 16:9 -w 2880
-    node record.js -u "https://figma.com/proto/..." -a 4:5 -w 1080 --fit screen
-    node record.js -u "https://figma.com/proto/..." -r 2880x1838
-    node record.js -u "https://figma.com/proto/..." -w 1920 -h 1226 -s 1.5
+    node record.js -u "https://figma.com/proto/..." -r 2880x1838 -d 1920
+    node record.js -u "https://figma.com/proto/..." -a 16:9 -w 2880 -d 1920
+    node record.js -u "https://figma.com/proto/..." -a 4:5 -w 1080 -d 1080
   `);
   process.exit(0);
 }
@@ -80,17 +87,17 @@ if (!Number.isFinite(scale) || scale <= 0) {
 // Video encoders are happiest with even dimensions.
 const even = (n) => Math.max(2, Math.round(n / 2) * 2);
 
-// The recording shape is decided here, independently of the frame size in
+// The output shape is decided here, independently of the frame size in
 // Figma: --res for an exact size, --aspect for a ratio applied to --width.
-let width;
-let height;
+let videoWidth;
+let videoHeight;
 let sizeSource;
 
 if (args.res !== undefined) {
   const match = String(args.res).trim().match(/^(\d+)\s*[x:*×]\s*(\d+)$/i);
   if (!match) die(`Invalid --res "${args.res}". Use WIDTHxHEIGHT, e.g. 2880x1838.`);
-  width = even(parseInt(match[1]));
-  height = even(parseInt(match[2]));
+  videoWidth = even(parseInt(match[1]));
+  videoHeight = even(parseInt(match[2]));
   sizeSource = `--res ${args.res}`;
 } else if (args.aspect !== undefined) {
   const raw = String(args.aspect).trim();
@@ -101,24 +108,44 @@ if (args.res !== undefined) {
   if (!Number.isFinite(ratio) || ratio <= 0) {
     die(`Invalid --aspect "${args.aspect}". Use W:H like 16:9 or 4:5, or a number like 1.78.`);
   }
-  width = even(parseInt(args.width));
-  height = even(width / ratio);
+  videoWidth = even(parseInt(args.width));
+  videoHeight = even(videoWidth / ratio);
   sizeSource = `--aspect ${raw}`;
 } else {
-  width = even(parseInt(args.width));
-  height = even(parseInt(args.height));
+  videoWidth = even(parseInt(args.width));
+  videoHeight = even(parseInt(args.height));
   sizeSource = '--width/--height';
 }
 
-if (!Number.isFinite(width) || !Number.isFinite(height) || width < 2 || height < 2) {
-  die(`Invalid recording size (${width}x${height}). Check --width/--height/--aspect/--res.`);
+if (!Number.isFinite(videoWidth) || !Number.isFinite(videoHeight) || videoWidth < 2 || videoHeight < 2) {
+  die(`Invalid recording size (${videoWidth}x${videoHeight}). Check --width/--height/--aspect/--res.`);
 }
 
-// Chromium renders at width x height CSS pixels; --scale raises the pixel
-// density, so the saved video ends up scale-times bigger in each direction.
-const deviceScaleFactor = scale;
-const videoWidth = even(width * scale);
-const videoHeight = even(height * scale);
+// The browser window is exactly the output size: Playwright never scales a
+// frame UP, it pads it with background, so a video bigger than the window would
+// come out framed in grey.
+const width = videoWidth;
+const height = videoHeight;
+
+// Figma only ever scales a frame DOWN to fit the window, never up, so on a
+// window wider than the design the prototype sits at its own size surrounded by
+// the prototype background. --design-width fixes that: the page is rendered at
+// designWidth-times-higher density and the canvas is then blown up by the same
+// factor, so the design fills the frame at full sharpness.
+const designWidth = args['design-width'] !== undefined ? parseInt(args['design-width']) : null;
+if (designWidth !== null && (!Number.isFinite(designWidth) || designWidth < 2)) {
+  die(`Invalid --design-width "${args['design-width']}". Use the frame width from Figma, e.g. 1920.`);
+}
+
+const fillScale = designWidth !== null ? videoWidth / designWidth : 1;
+if (fillScale < 1) {
+  die(`--design-width ${designWidth} is wider than the video (${videoWidth}px). Figma scales down on its own here, so drop --design-width.`);
+}
+
+const deviceScaleFactor = fillScale * scale;
+if (deviceScaleFactor > 4) {
+  console.log(`Note: rendering at ${deviceScaleFactor.toFixed(2)}x density — heavy on CPU/RAM. Lower the output size if playback stutters.`);
+}
 
 // How the Figma frame is fitted into that shape.
 const FIT_MODES = {
@@ -149,8 +176,10 @@ console.log(`Output:    ${outputPath}`);
 console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
 console.log(`Max:       ${args.maxdur}s (safety cap)`);
 console.log(`Stop:      press Enter`);
-console.log(`Video:     ${videoWidth}x${videoHeight}  aspect ${ratioLabel(videoWidth, videoHeight)}`);
-console.log(`Render:    ${width}x${height} @${scale}x  (from ${sizeSource})`);
+const trim = (n) => String(Number(n.toFixed(3)));
+console.log(`Video:     ${videoWidth}x${videoHeight}  aspect ${ratioLabel(videoWidth, videoHeight)}   (from ${sizeSource})`);
+console.log(`Window:    ${width}x${height} @${trim(deviceScaleFactor)}x density`);
+console.log(`Design:    ${designWidth !== null ? `${designWidth}px wide -> scaled up x${trim(fillScale)} to fill the frame` : 'not set (Figma will not scale the frame up; add -d if you see grey borders)'}`);
 console.log(`Fit:       ${fitKey} (scaling=${FIT_MODES[fitKey]})`);
 console.log();
 
@@ -175,8 +204,10 @@ console.log('Loading prototype...');
 await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
 await page.waitForTimeout(5000);
 
-// Hide cursor + lock canvas size to prevent zoom blink during transitions
-await page.evaluate(() => {
+// Hide cursor + lock canvas size to prevent zoom blink during transitions.
+// With --design-width, blow the canvas up so the design fills the frame; the
+// page already renders at fillScale density, so this stays pixel-for-pixel sharp.
+await page.evaluate((fillScale) => {
   const style = document.createElement('style');
   style.textContent = `
     * { cursor: none !important; }
@@ -188,10 +219,14 @@ await page.evaluate(() => {
       position: fixed !important;
       top: 0 !important;
       left: 0 !important;
+      ${fillScale !== 1 ? `
+      transform: scale(${fillScale}) !important;
+      transform-origin: 50% 50% !important;
+      ` : ''}
     }
   `;
   document.head.appendChild(style);
-});
+}, fillScale);
 
 await page.waitForTimeout(500);
 
