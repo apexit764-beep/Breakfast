@@ -1,0 +1,12 @@
+{
+  "name": "protomotion-recorder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "record": "node record.js"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

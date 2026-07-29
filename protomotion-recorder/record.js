@@ -1,0 +1,286 @@
+import { chromium } from '@playwright/test';
+import { parseArgs } from 'node:util';
+import path from 'node:path';
+import fs from 'node:fs';
+
+const { values: args } = parseArgs({
+  options: {
+    url:      { type: 'string',  short: 'u' },
+    output:   { type: 'string',  short: 'o', default: 'prototype.webm' },
+    maxdur:   { type: 'string',  short: 'm', default: '120' },
+    idle:     { type: 'string',  short: 'i', default: '5' },
+    pause:    { type: 'string',  short: 'p', default: '2' },
+    width:    { type: 'string',  short: 'w', default: '1536' },
+    height:   { type: 'string',  short: 'h', default: '864' },
+    scale:    { type: 'string',  short: 's', default: '1' },
+    zoom:     { type: 'string',  short: 'z', default: '1' },
+    focus:    { type: 'string',  short: 'f', default: 'center' },
+    manual:   { type: 'boolean', default: false },
+    headless: { type: 'boolean', default: false },
+    debug:    { type: 'boolean', default: false },
+    nodetect: { type: 'boolean', default: false },
+  },
+  strict: false,
+});
+
+if (!args.url) {
+  console.log(`
+  Figma Prototype Recorder
+
+  Usage:
+    node record.js -u <figma-prototype-url> [options]
+
+  Options:
+    -u, --url       Figma prototype URL (required)
+    -o, --output    Output file path (default: prototype.webm)
+    -m, --maxdur    Max recording duration in seconds (default: 120)
+    -i, --idle      Stop after this many seconds of no change (default: 5)
+    -p, --pause     Seconds to wait between auto-clicks (default: 2)
+    -w, --width     Viewport width (default: 1536)
+    -h, --height    Viewport height (default: 864)
+    -s, --scale     Device scale factor (default: 1)
+    -z, --zoom      Zoom factor for the recorded video, e.g. 2 or 3 (default: 1)
+    -f, --focus     Zoom focal point: center | top | bottom | left | right |
+                    top-left | top-right | bottom-left | bottom-right,
+                    or any CSS transform-origin like "50% 30%" (default: center)
+    --manual        You click manually in the browser, script only records
+    --headless      Run without visible browser
+    --debug         Print canvas size/zoom changes (to diagnose zoom blink)
+    --nodetect      Disable screenshot polling (no auto-stop; Enter or max only)
+
+  Examples:
+    node record.js -u "https://figma.com/proto/..."
+    node record.js -u "https://figma.com/proto/..." --manual
+    node record.js -u "https://figma.com/proto/..." -p 3 -w 1280 -h 720
+    node record.js -u "https://figma.com/proto/..." -z 2
+    node record.js -u "https://figma.com/proto/..." -z 3 -f top
+  `);
+  process.exit(0);
+}
+
+const width = parseInt(args.width);
+const height = parseInt(args.height);
+const maxDuration = parseInt(args.maxdur) * 1000;
+const idleTimeout = parseInt(args.idle) * 1000;
+const clickPause = parseInt(args.pause) * 1000;
+const scale = parseFloat(args.scale);
+const outputPath = path.resolve(args.output);
+const isManual = args.manual;
+
+const zoom = parseFloat(args.zoom);
+if (!Number.isFinite(zoom) || zoom < 1) {
+  console.error(`Invalid --zoom "${args.zoom}". Use 1 (no zoom) or higher, e.g. 2 or 3.`);
+  process.exit(1);
+}
+
+// Named focal points -> CSS transform-origin
+const FOCUS_PRESETS = {
+  'center':       '50% 50%',
+  'top':          '50% 0%',
+  'bottom':       '50% 100%',
+  'left':         '0% 50%',
+  'right':        '100% 50%',
+  'top-left':     '0% 0%',
+  'top-right':    '100% 0%',
+  'bottom-left':  '0% 100%',
+  'bottom-right': '100% 100%',
+};
+const focusKey = String(args.focus).trim().toLowerCase();
+const zoomOrigin = FOCUS_PRESETS[focusKey] ?? String(args.focus).trim();
+if (!/^[-\w%.\s]+$/.test(zoomOrigin)) {
+  console.error(`Invalid --focus "${args.focus}". Use one of: ${Object.keys(FOCUS_PRESETS).join(', ')} — or a CSS transform-origin like "50% 30%".`);
+  process.exit(1);
+}
+
+// Render the canvas at zoom-times the resolution so the magnified area stays
+// sharp instead of being an upscale of the 1x frame. Capped to protect memory.
+const MAX_DSF = 4;
+const requestedDsf = scale * zoom;
+const deviceScaleFactor = Math.min(requestedDsf, MAX_DSF);
+if (requestedDsf > MAX_DSF) {
+  console.log(`Note: scale x zoom = ${requestedDsf} exceeds the ${MAX_DSF}x cap; recording at ${MAX_DSF}x (zoom still applies, slightly softer).`);
+}
+
+// Force fit-width + hide UI
+const protoUrl = new URL(args.url);
+protoUrl.searchParams.set('scaling', 'scale-down-width');
+protoUrl.searchParams.set('hide-ui', '1');
+protoUrl.searchParams.set('hotspot-hints', '0');
+const finalUrl = protoUrl.toString();
+
+console.log(`Recording: ${finalUrl}`);
+console.log(`Output:    ${outputPath}`);
+console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks center every ' + args.pause + 's)'}`);
+console.log(`Max:       ${args.maxdur}s`);
+console.log(`Idle stop: ${args.nodetect ? 'disabled (press Enter to stop)' : args.idle + 's of no change'}`);
+console.log(`Viewport:  ${width}x${height} @${scale}x`);
+console.log(`Zoom:      ${zoom === 1 ? 'off (1x)' : `${zoom}x on ${focusKey in FOCUS_PRESETS ? focusKey : zoomOrigin} (render @${deviceScaleFactor}x)`}`);
+console.log();
+
+const browser = await chromium.launch({
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
+  headless: args.headless,
+  args: ['--no-sandbox'],
+});
+
+const context = await browser.newContext({
+  viewport: { width, height },
+  deviceScaleFactor,
+  recordVideo: {
+    dir: path.dirname(outputPath),
+    size: { width, height },
+  },
+});
+
+const page = await context.newPage();
+
+console.log('Loading prototype...');
+await page.goto(finalUrl, { waitUntil: 'load', timeout: 60_000 });
+await page.waitForTimeout(5000);
+
+// Hide cursor + lock canvas size to prevent zoom blink during transitions,
+// and magnify the canvas when --zoom is used.
+await page.evaluate(({ zoom, zoomOrigin }) => {
+  const style = document.createElement('style');
+  style.textContent = `
+    * { cursor: none !important; }
+    html, body { overflow: hidden !important; }
+    canvas {
+      width: 100vw !important;
+      height: 100vh !important;
+      object-fit: contain !important;
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      ${zoom !== 1 ? `
+      transform: scale(${zoom}) !important;
+      transform-origin: ${zoomOrigin} !important;
+      image-rendering: auto !important;
+      ` : ''}
+    }
+  `;
+  document.head.appendChild(style);
+}, { zoom, zoomOrigin });
+
+await page.waitForTimeout(500);
+
+// Auto-clicks should keep hitting the middle of the prototype, not the middle
+// of the viewport, which is a different point once the canvas is magnified.
+let clickX = width / 2;
+let clickY = height / 2;
+if (!isManual && zoom !== 1) {
+  const rect = await page.evaluate(() => {
+    const c = document.querySelector('canvas');
+    if (!c) return null;
+    const r = c.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  });
+  if (rect) {
+    const clamp = (v, max) => Math.min(Math.max(v, 1), max - 1);
+    clickX = clamp(rect.x + rect.width / 2, width);
+    clickY = clamp(rect.y + rect.height / 2, height);
+  }
+}
+
+if (isManual) {
+  console.log('Recording... Click in the browser to interact with the prototype.');
+} else {
+  console.log('Recording... (auto-clicking + auto-stop on idle)');
+}
+console.log('Press Enter to stop and save at any time.\n');
+
+// Listen for Enter key to manually stop
+let manualStop = false;
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdin.on('data', (key) => {
+  if (key[0] === 13 || key[0] === 10 || key[0] === 3) {
+    manualStop = true;
+  }
+});
+
+const detectIdle = !args.nodetect;
+// scale: 'css' keeps idle-detection screenshots viewport-sized even when the
+// page renders at a higher device scale factor because of --zoom.
+const shotOptions = { type: 'png', scale: 'css' };
+let previousShot = detectIdle ? await page.screenshot(shotOptions) : null;
+let idleStart = null;
+let lastClickTime = 0;
+let lastProbe = '';
+const startTime = Date.now();
+let stopReason = '';
+
+while (Date.now() - startTime < maxDuration) {
+  if (manualStop) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    stopReason = `Stopped manually after ${elapsed}s`;
+    break;
+  }
+
+  const now = Date.now();
+
+  if (!isManual && now - lastClickTime >= clickPause) {
+    await page.mouse.click(clickX, clickY);
+    lastClickTime = now;
+  }
+
+  await page.waitForTimeout(400);
+
+  if (args.debug) {
+    const probe = await page.evaluate(() => {
+      const c = document.querySelector('canvas');
+      if (!c) return null;
+      return {
+        buffer: `${c.width}x${c.height}`,
+        css: `${c.clientWidth}x${c.clientHeight}`,
+        transform: getComputedStyle(c).transform,
+        window: `${window.innerWidth}x${window.innerHeight}`,
+        dpr: window.devicePixelRatio,
+      };
+    });
+    if (probe) {
+      const line = `buffer=${probe.buffer} css=${probe.css} win=${probe.window} dpr=${probe.dpr} transform=${probe.transform}`;
+      if (line !== lastProbe) {
+        console.log(`[${((Date.now() - startTime) / 1000).toFixed(1)}s] ${line}`);
+        lastProbe = line;
+      }
+    }
+  }
+
+  if (!detectIdle) continue;
+
+  const currentShot = await page.screenshot(shotOptions);
+  const changed = !previousShot.equals(currentShot);
+
+  if (changed) {
+    idleStart = null;
+    previousShot = currentShot;
+  } else {
+    if (!idleStart) idleStart = Date.now();
+    if (Date.now() - idleStart >= idleTimeout) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      stopReason = `Prototype finished after ${elapsed}s`;
+      break;
+    }
+  }
+}
+
+process.stdin.setRawMode(false);
+process.stdin.pause();
+
+if (!stopReason) {
+  stopReason = `Reached max duration (${args.maxdur}s)`;
+}
+console.log(stopReason);
+
+console.log('Saving video...');
+await context.close();
+
+const video = page.video();
+if (video) {
+  const savedPath = await video.path();
+  fs.renameSync(savedPath, outputPath);
+}
+
+await browser.close();
+console.log(`Done! Video saved to: ${outputPath}`);
