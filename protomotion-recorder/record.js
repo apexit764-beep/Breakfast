@@ -20,6 +20,7 @@ const { values: args } = parseArgs({
     manual:   { type: 'boolean', default: false },
     realtime: { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
+    headed:   { type: 'boolean', default: false },
     uncap:    { type: 'boolean', default: false },
     'keep-frames': { type: 'boolean', default: false },
     'encode-from': { type: 'string' },
@@ -69,7 +70,11 @@ if (!args.url && !args['encode-from']) {
     --manual        You click manually in the browser, script only records
                     (realtime mode only)
     --realtime      Use realtime capture instead of smooth stepping
-    --headless      Run without visible browser
+    --headless      Realtime mode: run without a visible browser window
+    --headed        Smooth mode: show the browser window anyway. WARNING: a
+                    visible window cannot be bigger than your screen, so a
+                    frame larger than the screen gets clipped - that is why
+                    smooth mode is headless by default
     --uncap         Realtime mode: let Chromium paint without the vsync cap
     --keep-frames   Keep the captured .jpg frames folder next to the output
     --encode-from <dir>
@@ -283,9 +288,21 @@ console.log();
 const launchArgs = ['--no-sandbox'];
 if (args.uncap) launchArgs.push('--disable-gpu-vsync', '--disable-frame-rate-limit');
 
+// Smooth mode runs headless by default: a real OS window can never be bigger
+// than the screen, so a Figma frame larger than the display would come out
+// clipped at the edges. Headless has no window, so any frame size renders in
+// full. Realtime/manual keep a visible window (you may need to click).
+const headless = isSmooth ? !args.headed : args.headless;
+if (isSmooth && args.headed) {
+  console.log(`Note: --headed with a ${width}x${height} frame - if that is bigger than your screen, the video WILL be clipped. Drop --headed to be safe.`);
+}
+if (!isSmooth && !args.headless) {
+  console.log(`Note: with a visible window the recording cannot be bigger than your screen; if ${width}x${height} does not fit, edges will be clipped. Smooth mode (default, no --manual/--realtime) has no such limit.`);
+}
+
 const browser = await chromium.launch({
   executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined,
-  headless: args.headless,
+  headless,
   args: launchArgs,
 });
 
