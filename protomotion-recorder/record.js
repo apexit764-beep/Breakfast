@@ -22,12 +22,13 @@ const { values: args } = parseArgs({
     headless: { type: 'boolean', default: false },
     uncap:    { type: 'boolean', default: false },
     'keep-frames': { type: 'boolean', default: false },
+    'encode-from': { type: 'string' },
     debug:    { type: 'boolean', default: false },
   },
   strict: false,
 });
 
-if (!args.url) {
+if (!args.url && !args['encode-from']) {
   console.log(`
   Figma Prototype Recorder
 
@@ -71,6 +72,9 @@ if (!args.url) {
     --headless      Run without visible browser
     --uncap         Realtime mode: let Chromium paint without the vsync cap
     --keep-frames   Keep the captured .jpg frames folder next to the output
+    --encode-from <dir>
+                    Skip recording; encode a previously kept frames folder
+                    (e.g. after a failed encode) into -o
     --debug         Print canvas size changes while recording
 
   Recording stops when you press Enter (or when --maxdur is reached).
@@ -87,6 +91,19 @@ const die = (message) => {
   console.error(message);
   process.exit(1);
 };
+
+// Options from older versions of this script. parseArgs would silently ignore
+// them (and swallow their value), which once cost a whole recording - so they
+// are hard errors instead.
+const REMOVED_OPTIONS = ['-a', '--aspect', '-r', '--res', '-d', '--design-width', '-z', '--zoom',
+  '-f', '--focus', '--fit', '-s', '--scale', '--upscale', '--nodetect', '-i', '--idle'];
+const removedUsed = process.argv.slice(2).find((token) => REMOVED_OPTIONS.includes(token.split('=')[0]));
+if (removedUsed) {
+  die(`"${removedUsed}" was removed from this script.\n` +
+    `The video is always 1:1 the size of your Figma frame - pass that size directly:\n` +
+    `  node record.js -u "..." -w <frame width> -h <frame height>\n` +
+    `Example for a 2066x1550 frame:  -w 2066 -h 1550`);
+}
 
 // Video encoders are happiest with even dimensions.
 const even = (n) => Math.max(2, Math.round(n / 2) * 2);
@@ -168,6 +185,75 @@ if (!ffmpeg.canConcat) {
 }
 if (isMp4 && !ffmpeg.canH264) {
   die(`The ffmpeg found at ${ffmpeg.path} cannot write mp4 (no libx264).\nRun "npm install" in this folder to get a full build, or record to .webm instead.`);
+}
+
+const codecArgs = () => isMp4
+  ? ['-c:v', 'libx264', '-preset', x264Preset, '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart']
+  : ffmpeg.canVp9
+    ? ['-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0', '-pix_fmt', 'yuv420p']
+    : ['-c:v', 'libvpx', '-crf', String(crf), '-b:v', '12M'];
+
+// The scale in every encode is a safety net: captures can come back at odd or
+// unexpected sizes (Windows display scaling), and libx264 rejects odd widths.
+const scaleFilter = (w, h) => `scale=${w}:${h}:flags=lanczos,setsar=1`;
+
+async function runEncode(inputArgs, totalSeconds, frames, megabytes) {
+  console.log(`Encoding ${frames} frames (${megabytes.toFixed(0)} MB) -> ${path.basename(outputPath)} ...`);
+  const started = Date.now();
+  const child = spawn(ffmpeg.path, ['-y', ...inputArgs, '-r', String(fps), ...codecArgs(), outputPath],
+    { stdio: ['ignore', 'ignore', 'pipe'] });
+  let errorLog = '';
+  let lastReport = '';
+  child.stderr.on('data', (chunk) => {
+    errorLog += chunk.toString();
+    const match = errorLog.match(/time=(\d+):(\d+):(\d+\.\d+)(?![\s\S]*time=)/);
+    if (match) {
+      const done = (+match[1] * 3600 + +match[2] * 60 + +match[3]);
+      const report = `  encoded ${done.toFixed(0)}s / ${totalSeconds.toFixed(0)}s`;
+      if (report !== lastReport) {
+        process.stdout.write(report + '\r');
+        lastReport = report;
+      }
+    }
+  });
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  process.stdout.write('\n');
+  return { code, errorLog, seconds: (Date.now() - started) / 1000 };
+}
+
+// ---- Rescue mode: encode an existing frames folder ---------------------------
+if (args['encode-from']) {
+  const dir = path.resolve(args['encode-from']);
+  const frames = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /^f_\d{6}\.jpg$/.test(f)).sort() : [];
+  if (!frames.length) die(`No f_XXXXXX.jpg frames found in ${dir}.`);
+
+  // Match the frames' own size (rounded to even) unless -w/-h were given.
+  const probe = spawnSync(ffmpeg.path, ['-hide_banner', '-i', path.join(dir, frames[0])], { encoding: 'utf8' });
+  const probed = (probe.stderr || '').match(/, (\d{2,5})x(\d{2,5})/);
+  const explicitSize = process.argv.some((a) => ['-w', '--width', '-h', '--height'].includes(a));
+  const targetW = explicitSize || !probed ? width : even(parseInt(probed[1]));
+  const targetH = explicitSize || !probed ? height : even(parseInt(probed[2]));
+
+  const listPath = path.join(dir, 'frames.ffconcat');
+  const hasList = fs.existsSync(listPath);
+  const inputArgs = hasList
+    ? ['-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `${scaleFilter(targetW, targetH)},fps=${fps}`]
+    : ['-framerate', String(fps), '-i', path.join(dir, 'f_%06d.jpg'), '-vf', scaleFilter(targetW, targetH)];
+  const seconds = frames.length / fps;
+  const megabytes = frames.reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0) / 1024 / 1024;
+
+  console.log(`Re-encoding kept frames from: ${dir}`);
+  console.log(`Size:      ${targetW}x${targetH}${probed ? ` (frames are ${probed[1]}x${probed[2]})` : ''}`);
+  const result = await runEncode(inputArgs, seconds, frames.length, megabytes);
+  if (result.code !== 0 || !fs.existsSync(outputPath)) {
+    console.error(`ffmpeg failed (exit ${result.code}):`);
+    console.error(result.errorLog.split('\n').filter(Boolean).slice(-12).join('\n'));
+    process.exit(1);
+  }
+  const outMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
+  console.log(`Done! Video saved to: ${outputPath}  (${outMb} MB, encoded in ${result.seconds.toFixed(1)}s)`);
+  console.log(`The frames folder was left untouched; delete it when you are happy with the video.`);
+  process.exit(0);
 }
 
 // Frames are captured to disk first, encoded after the recording stops.
@@ -339,10 +425,14 @@ if (isSmooth) {
     }
     vt = stepped;
 
+    // clip pins the capture to the CSS viewport at scale 1; without it, OS
+    // display scaling (e.g. Windows at 125-150%) returns surface pixels of a
+    // different, possibly odd size, which the encoder then rejects.
     const shot = await cdp.send('Page.captureScreenshot', {
       format: 'jpeg',
       quality: jpegQuality,
       fromSurface: true,
+      clip: { x: 0, y: 0, width, height, scale: 1 },
     });
     const buffer = Buffer.from(shot.data, 'base64');
     frameCount++;
@@ -483,10 +573,11 @@ if (frameCount === 0) {
 const recordedSeconds = videoSeconds;
 const averageFps = isSmooth ? fps : frameCount / recordedSeconds;
 
-const encodeArgs = ['-y'];
+const inputArgs = [];
 if (isSmooth) {
   // Smooth mode produced one frame per 1/fps exactly - a plain image sequence.
-  encodeArgs.push('-framerate', String(fps), '-i', path.join(framesDir, 'f_%06d.jpg'), '-r', String(fps));
+  inputArgs.push('-framerate', String(fps), '-i', path.join(framesDir, 'f_%06d.jpg'),
+    '-vf', scaleFilter(width, height));
 } else {
   // Realtime mode: each frame is shown from its capture time until the next
   // frame's capture time; the concat demuxer takes exactly that as per-frame
@@ -506,42 +597,17 @@ if (isSmooth) {
   listLines.push(`file '${frameName(lastIndex)}'`);
   const listPath = path.join(framesDir, 'frames.ffconcat');
   fs.writeFileSync(listPath, listLines.join('\n') + '\n');
-  encodeArgs.push('-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `fps=${fps}`, '-r', String(fps));
+  inputArgs.push('-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `${scaleFilter(width, height)},fps=${fps}`);
 }
-if (isMp4) {
-  encodeArgs.push('-c:v', 'libx264', '-preset', x264Preset, '-crf', String(crf),
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
-} else if (ffmpeg.canVp9) {
-  encodeArgs.push('-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0', '-pix_fmt', 'yuv420p');
-} else {
-  encodeArgs.push('-c:v', 'libvpx', '-crf', String(crf), '-b:v', '12M');
-}
-encodeArgs.push(outputPath);
 
-console.log(`Encoding ${frameCount} frames (${(bytesWritten / 1024 / 1024).toFixed(0)} MB) -> ${path.basename(outputPath)} ...`);
-const encodeStarted = Date.now();
-const encoder = spawn(ffmpeg.path, encodeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
-let encoderError = '';
-let lastReport = '';
-encoder.stderr.on('data', (chunk) => {
-  encoderError += chunk.toString();
-  const match = encoderError.match(/time=(\d+):(\d+):(\d+\.\d+)(?![\s\S]*time=)/);
-  if (match) {
-    const done = (+match[1] * 3600 + +match[2] * 60 + +match[3]);
-    const report = `  encoded ${done.toFixed(0)}s / ${recordedSeconds.toFixed(0)}s`;
-    if (report !== lastReport) {
-      process.stdout.write(report + '\r');
-      lastReport = report;
-    }
-  }
-});
-const encoderCode = await new Promise((resolve) => encoder.on('close', resolve));
-process.stdout.write('\n');
+const result = await runEncode(inputArgs, recordedSeconds, frameCount, bytesWritten / 1024 / 1024);
 
-if (encoderCode !== 0 || !fs.existsSync(outputPath)) {
-  console.error(`ffmpeg failed (exit ${encoderCode}):`);
-  console.error(encoderError.split('\n').filter(Boolean).slice(-12).join('\n'));
+if (result.code !== 0 || !fs.existsSync(outputPath)) {
+  console.error(`ffmpeg failed (exit ${result.code}):`);
+  console.error(result.errorLog.split('\n').filter(Boolean).slice(-12).join('\n'));
   console.error(`The captured frames were kept in: ${framesDir}`);
+  console.error(`You can retry the encode without re-recording:`);
+  console.error(`  node record.js --encode-from "${framesDir}" -o "${args.output}"`);
   process.exit(1);
 }
 
@@ -552,7 +618,7 @@ if (args['keep-frames']) {
 }
 
 const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
-const encodeSeconds = ((Date.now() - encodeStarted) / 1000).toFixed(1);
+const encodeSeconds = result.seconds.toFixed(1);
 console.log(`Done! Video saved to: ${outputPath}  (${sizeMb} MB, encoded in ${encodeSeconds}s)`);
 if (isSmooth) {
   console.log(`Length:    ${videoSeconds.toFixed(1)}s of video at a true ${fps} fps - every frame is a distinct render`);
