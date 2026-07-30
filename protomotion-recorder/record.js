@@ -18,6 +18,7 @@ const { values: args } = parseArgs({
     maxdur:   { type: 'string',  short: 'm', default: '600' },
     pause:    { type: 'string',  short: 'p', default: '2' },
     manual:   { type: 'boolean', default: false },
+    realtime: { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
     uncap:    { type: 'boolean', default: false },
     'keep-frames': { type: 'boolean', default: false },
@@ -33,9 +34,20 @@ if (!args.url) {
   Records a Figma prototype at exactly the size of your Figma frame: 1:1, no
   scaling, no zoom. Output is mp4 (H.264) at 60 fps by default.
 
-  Recording and encoding are two separate phases: while recording, frames are
-  only saved to disk (cheap), and the video is encoded after you stop. A slow
-  encoder can never slow down, stutter or slow-motion the recording.
+  Two recording modes:
+
+  SMOOTH (default) - the page's clock is frozen and stepped forward exactly
+  1/fps per frame, and every frame is captured individually. Every single
+  frame of the video is a real, distinct render: perfect 60 fps smoothness,
+  no matter how slow the machine is. Capturing runs slower than real time
+  (the video still plays at real speed). Auto-click only.
+
+  REALTIME (--realtime, or implied by --manual) - the prototype runs live and
+  painted frames are grabbed as they come. Interactive, records in real time,
+  but smoothness is limited by how fast the machine paints.
+
+  In both modes frames go to disk first and the video is encoded after you
+  stop, so encoding speed can never slow motion or stutter the result.
 
   Usage:
     node record.js -u <figma-prototype-url> -w <frame width> -h <frame height>
@@ -47,26 +59,26 @@ if (!args.url) {
     -h, --height    Frame height from Figma (default: 1080)
     --fps           Frames per second of the output (default: 60)
     -q, --quality   CRF quality, lower = better/bigger (default: 18)
-    --jpeg          Quality of the frames grabbed from the browser, 1-100
-                    (default: 92). Lower = smaller frames on disk
+    --jpeg          Quality of captured frames, 1-100 (default: 92)
     --preset        x264 encode preset, ultrafast..slow (default: veryfast).
                     Encoding happens after recording, so slower is safe
-    -m, --maxdur    Safety cap on recording length in seconds (default: 600)
-    -p, --pause     Seconds to wait between auto-clicks (default: 2)
+    -m, --maxdur    Safety cap on recording length in seconds (default: 600).
+                    In smooth mode this is video time, not capture time
+    -p, --pause     Seconds between auto-clicks, in video time (default: 2)
     --manual        You click manually in the browser, script only records
+                    (realtime mode only)
+    --realtime      Use realtime capture instead of smooth stepping
     --headless      Run without visible browser
-    --uncap         Let Chromium paint without the vsync/frame-rate cap. Can
-                    raise the frame rate, can also cause stutter - test both
+    --uncap         Realtime mode: let Chromium paint without the vsync cap
     --keep-frames   Keep the captured .jpg frames folder next to the output
     --debug         Print canvas size changes while recording
 
   Recording stops when you press Enter (or when --maxdur is reached).
-  While recording, a stats line every 5s shows the real frame rate.
 
   Examples:
     node record.js -u "https://figma.com/proto/..." -w 1920 -h 1226
-    node record.js -u "https://figma.com/proto/..." -w 1920 -h 1226 --manual
     node record.js -u "https://figma.com/proto/..." -w 1920 -h 1226 --fps 30
+    node record.js -u "https://figma.com/proto/..." -w 1920 -h 1226 --manual
   `);
   process.exit(0);
 }
@@ -110,6 +122,8 @@ const maxDuration = parseInt(args.maxdur) * 1000;
 const clickPause = parseInt(args.pause) * 1000;
 const outputPath = path.resolve(args.output);
 const isManual = args.manual;
+// Manual interaction needs the prototype running live, so it forces realtime.
+const isSmooth = !args.realtime && !isManual;
 
 const outputExt = path.extname(outputPath).toLowerCase();
 if (!['.mp4', '.webm'].includes(outputExt)) {
@@ -173,8 +187,10 @@ console.log(`Recording: ${finalUrl}`);
 console.log(`Output:    ${outputPath}`);
 console.log(`Size:      ${width}x${height} 1:1 (no scaling)`);
 console.log(`Format:    ${isMp4 ? 'mp4 / H.264' : ffmpeg.canVp9 ? 'webm / VP9' : 'webm / VP8'} @${fps}fps, crf ${crf}, jpeg ${jpegQuality}`);
-console.log(`Mode:      ${isManual ? 'Manual (you click)' : 'Auto (clicks centre every ' + args.pause + 's)'}`);
-console.log(`Max:       ${args.maxdur}s (safety cap)`);
+console.log(`Mode:      ${isSmooth
+  ? `Smooth (stepped clock, every frame distinct; auto-click every ${args.pause}s of video time)`
+  : isManual ? 'Realtime, manual (you click)' : `Realtime, auto (clicks centre every ${args.pause}s)`}`);
+console.log(`Max:       ${args.maxdur}s ${isSmooth ? 'of video' : ''}(safety cap)`);
 console.log(`Stop:      press Enter`);
 console.log();
 
@@ -218,46 +234,6 @@ await page.evaluate(() => {
 
 await page.waitForTimeout(500);
 
-// ---- Capture phase ----------------------------------------------------------
-// Chromium streams JPEG frames over CDP; each one is written straight to disk
-// together with its CAPTURE time. Nothing else competes for the CPU while
-// recording. Timing the frames at capture (instead of when an encoder gets
-// round to reading them) is what keeps the video at real speed: stamping them
-// at read time stretches the timeline whenever encoding lags, which shows up
-// as slow motion.
-const frameTimes = [];
-let bytesWritten = 0;
-
-const cdp = await context.newCDPSession(page);
-cdp.on('Page.screencastFrame', (frame) => {
-  const ack = cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
-  const buffer = Buffer.from(frame.data, 'base64');
-  const index = frameTimes.length + 1;
-  try {
-    fs.writeFileSync(path.join(framesDir, `f_${String(index).padStart(6, '0')}.jpg`), buffer);
-  } catch (error) {
-    die(`Cannot write frames to ${framesDir}: ${error.message}`);
-  }
-  frameTimes.push(frame.metadata?.timestamp ?? Date.now() / 1000);
-  bytesWritten += buffer.length;
-  return ack;
-});
-
-await cdp.send('Page.startScreencast', {
-  format: 'jpeg',
-  quality: jpegQuality,
-  maxWidth: width,
-  maxHeight: height,
-  everyNthFrame: 1,
-});
-
-if (isManual) {
-  console.log('Recording... Click in the browser to interact with the prototype.');
-} else {
-  console.log(`Recording... (auto-clicking every ${args.pause}s)`);
-}
-console.log('Press Enter to stop and save at any time.\n');
-
 // Listen for Enter key to manually stop
 let manualStop = false;
 process.stdin.setRawMode(true);
@@ -268,108 +244,270 @@ process.stdin.on('data', (key) => {
   }
 });
 
-const startTime = Date.now();
-let lastClickTime = 0;
-let lastProbe = '';
+const cdp = await context.newCDPSession(page);
+const frameName = (index) => `f_${String(index).padStart(6, '0')}.jpg`;
+
+const frameTimes = [];   // realtime mode: capture timestamps
+let frameCount = 0;
+let bytesWritten = 0;
 let stopReason = '';
+let videoSeconds = 0;    // length of the resulting video
+let captureSeconds = 0;  // wall-clock time spent capturing
+const startTime = Date.now();
 
-// Live stats: real painted frame rate + disk usage of the captured frames.
-let statsAt = startTime;
-let statsFrames = 0;
-const statsTimer = setInterval(() => {
-  const now = Date.now();
-  const rate = (frameTimes.length - statsFrames) / ((now - statsAt) / 1000);
-  console.log(`[${String(Math.round((now - startTime) / 1000)).padStart(3)}s] ` +
-    `${rate.toFixed(1)} fps painted  frames ${frameTimes.length}  disk ${(bytesWritten / 1024 / 1024).toFixed(0)} MB`);
-  statsAt = now;
-  statsFrames = frameTimes.length;
-}, 5000);
+if (isSmooth) {
+  // ---- Smooth capture ---------------------------------------------------------
+  // The page's clock (performance.now, Date.now, rAF, timers) is replaced by a
+  // virtual clock that only moves when we step it. Every step advances exactly
+  // 1/fps seconds and is followed by a screenshot, so every video frame is a
+  // real, distinct render exactly 1/fps apart - smoothness no longer depends on
+  // how fast this machine paints. Capture runs slower than real time; the video
+  // still plays at real speed because the timeline is the virtual clock.
+  const installVirtualClock = (startVt) => page.evaluate((vt0) => {
+    const state = { vt: vt0, rafQ: new Map(), rafId: 1, timers: new Map(), timerId: 1 };
+    const epoch = Date.now() - vt0;
+    performance.now = () => state.vt;
+    Date.now = () => epoch + state.vt;
+    window.requestAnimationFrame = (cb) => { const id = state.rafId++; state.rafQ.set(id, cb); return id; };
+    window.cancelAnimationFrame = (id) => { state.rafQ.delete(id); };
+    window.setTimeout = (cb, delay = 0, ...rest) => {
+      if (typeof cb !== 'function') return 0;
+      const id = state.timerId++;
+      state.timers.set(id, { due: state.vt + Math.max(0, Number(delay) || 0), cb, rest, interval: null });
+      return id;
+    };
+    window.setInterval = (cb, delay = 0, ...rest) => {
+      if (typeof cb !== 'function') return 0;
+      const id = state.timerId++;
+      const step = Math.max(1, Number(delay) || 1);
+      state.timers.set(id, { due: state.vt + step, cb, rest, interval: step });
+      return id;
+    };
+    window.clearTimeout = window.clearInterval = (id) => { state.timers.delete(id); };
+    window.__vtStep = (ms) => {
+      const target = state.vt + ms;
+      for (let guard = 0; guard < 10_000; guard++) {
+        let nextId = null;
+        let nextTimer = null;
+        for (const [id, timer] of state.timers) {
+          if (timer.due <= target && (!nextTimer || timer.due < nextTimer.due)) { nextId = id; nextTimer = timer; }
+        }
+        if (!nextTimer) break;
+        state.vt = nextTimer.due;
+        if (nextTimer.interval) nextTimer.due += nextTimer.interval; else state.timers.delete(nextId);
+        try { nextTimer.cb(...nextTimer.rest); } catch {}
+      }
+      state.vt = target;
+      const callbacks = [...state.rafQ.values()];
+      state.rafQ.clear();
+      for (const cb of callbacks) { try { cb(state.vt); } catch {} }
+      return state.vt;
+    };
+  }, startVt);
 
-while (Date.now() - startTime < maxDuration) {
-  if (manualStop) {
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    stopReason = `Stopped manually after ${elapsed}s`;
-    break;
-  }
+  let vt = await page.evaluate(() => performance.now());
+  await installVirtualClock(vt);
+  // let the page's in-flight real rAF hand over to the virtual queue
+  await page.waitForTimeout(100);
 
-  const now = Date.now();
+  console.log(`Recording (smooth)... every frame is rendered and captured one by one.`);
+  console.log('Press Enter to stop and save at any time.\n');
 
-  if (!isManual && now - lastClickTime >= clickPause) {
-    await page.mouse.click(width / 2, height / 2);
-    lastClickTime = now;
-  }
+  const stepMs = 1000 / fps;
+  const maxFrames = Math.ceil((maxDuration / 1000) * fps);
+  const vtStart = vt;
+  let lastClickVt = -Infinity;
+  let statsAt = Date.now();
+  let statsFrames = 0;
 
-  await page.waitForTimeout(400);
+  while (frameCount < maxFrames && !manualStop) {
+    if (!isManual && vt - lastClickVt >= clickPause) {
+      await page.mouse.click(width / 2, height / 2);
+      lastClickVt = vt;
+    }
 
-  if (args.debug) {
-    const probe = await page.evaluate(() => {
-      const c = document.querySelector('canvas');
-      if (!c) return null;
-      return {
-        buffer: `${c.width}x${c.height}`,
-        css: `${c.clientWidth}x${c.clientHeight}`,
-        window: `${window.innerWidth}x${window.innerHeight}`,
-        dpr: window.devicePixelRatio,
-      };
+    let stepped = null;
+    try {
+      stepped = await page.evaluate((ms) => (window.__vtStep ? window.__vtStep(ms) : null), stepMs);
+    } catch {
+      stepped = null;
+    }
+    if (stepped === null) {
+      // page navigated and lost the virtual clock - reinstall and continue
+      await installVirtualClock(vt);
+      continue;
+    }
+    vt = stepped;
+
+    const shot = await cdp.send('Page.captureScreenshot', {
+      format: 'jpeg',
+      quality: jpegQuality,
+      fromSurface: true,
     });
-    if (probe) {
-      const line = `buffer=${probe.buffer} css=${probe.css} win=${probe.window} dpr=${probe.dpr}`;
-      if (line !== lastProbe) {
-        console.log(`[${((Date.now() - startTime) / 1000).toFixed(1)}s] ${line}`);
-        lastProbe = line;
+    const buffer = Buffer.from(shot.data, 'base64');
+    frameCount++;
+    try {
+      fs.writeFileSync(path.join(framesDir, frameName(frameCount)), buffer);
+    } catch (error) {
+      die(`Cannot write frames to ${framesDir}: ${error.message}`);
+    }
+    bytesWritten += buffer.length;
+
+    if (Date.now() - statsAt >= 5000) {
+      const captured = frameCount - statsFrames;
+      const speed = (captured / fps) / ((Date.now() - statsAt) / 1000);
+      console.log(`[${((vt - vtStart) / 1000).toFixed(1).padStart(5)}s video] ` +
+        `${frameCount} frames  disk ${(bytesWritten / 1024 / 1024).toFixed(0)} MB  capturing at ${speed.toFixed(2)}x real time`);
+      statsAt = Date.now();
+      statsFrames = frameCount;
+    }
+  }
+
+  videoSeconds = frameCount / fps;
+  captureSeconds = (Date.now() - startTime) / 1000;
+  stopReason = manualStop
+    ? `Stopped manually at ${videoSeconds.toFixed(1)}s of video (${captureSeconds.toFixed(0)}s of capturing)`
+    : `Reached max duration (${args.maxdur}s of video)`;
+} else {
+  // ---- Realtime capture -------------------------------------------------------
+  // Chromium streams JPEG frames over CDP; each one is written straight to disk
+  // together with its CAPTURE time. Timing the frames at capture (instead of
+  // when an encoder gets round to reading them) is what keeps the video at real
+  // speed even when the machine is slow.
+  cdp.on('Page.screencastFrame', (frame) => {
+    const ack = cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
+    const buffer = Buffer.from(frame.data, 'base64');
+    try {
+      fs.writeFileSync(path.join(framesDir, frameName(frameTimes.length + 1)), buffer);
+    } catch (error) {
+      die(`Cannot write frames to ${framesDir}: ${error.message}`);
+    }
+    frameTimes.push(frame.metadata?.timestamp ?? Date.now() / 1000);
+    bytesWritten += buffer.length;
+    return ack;
+  });
+
+  await cdp.send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: jpegQuality,
+    maxWidth: width,
+    maxHeight: height,
+    everyNthFrame: 1,
+  });
+
+  if (isManual) {
+    console.log('Recording... Click in the browser to interact with the prototype.');
+  } else {
+    console.log(`Recording... (auto-clicking every ${args.pause}s)`);
+  }
+  console.log('Press Enter to stop and save at any time.\n');
+
+  let lastClickTime = 0;
+  let lastProbe = '';
+  let statsAt = startTime;
+  let statsFrames = 0;
+  const statsTimer = setInterval(() => {
+    const now = Date.now();
+    const rate = (frameTimes.length - statsFrames) / ((now - statsAt) / 1000);
+    console.log(`[${String(Math.round((now - startTime) / 1000)).padStart(3)}s] ` +
+      `${rate.toFixed(1)} fps painted  frames ${frameTimes.length}  disk ${(bytesWritten / 1024 / 1024).toFixed(0)} MB`);
+    statsAt = now;
+    statsFrames = frameTimes.length;
+  }, 5000);
+
+  while (Date.now() - startTime < maxDuration) {
+    if (manualStop) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      stopReason = `Stopped manually after ${elapsed}s`;
+      break;
+    }
+
+    const now = Date.now();
+
+    if (!isManual && now - lastClickTime >= clickPause) {
+      await page.mouse.click(width / 2, height / 2);
+      lastClickTime = now;
+    }
+
+    await page.waitForTimeout(400);
+
+    if (args.debug) {
+      const probe = await page.evaluate(() => {
+        const c = document.querySelector('canvas');
+        if (!c) return null;
+        return {
+          buffer: `${c.width}x${c.height}`,
+          css: `${c.clientWidth}x${c.clientHeight}`,
+          window: `${window.innerWidth}x${window.innerHeight}`,
+          dpr: window.devicePixelRatio,
+        };
+      });
+      if (probe) {
+        const line = `buffer=${probe.buffer} css=${probe.css} win=${probe.window} dpr=${probe.dpr}`;
+        if (line !== lastProbe) {
+          console.log(`[${((Date.now() - startTime) / 1000).toFixed(1)}s] ${line}`);
+          lastProbe = line;
+        }
       }
     }
   }
+
+  clearInterval(statsTimer);
+  if (!stopReason) {
+    stopReason = `Reached max duration (${args.maxdur}s)`;
+  }
+
+  frameCount = frameTimes.length;
+  videoSeconds = (Date.now() - startTime) / 1000;
+  captureSeconds = videoSeconds;
+  try {
+    await cdp.send('Page.stopScreencast');
+  } catch {
+    // page already gone
+  }
 }
 
-clearInterval(statsTimer);
 process.stdin.setRawMode(false);
 process.stdin.pause();
-
-if (!stopReason) {
-  stopReason = `Reached max duration (${args.maxdur}s)`;
-}
 console.log(stopReason);
 
 const stoppedAt = Date.now();
-try {
-  await cdp.send('Page.stopScreencast');
-} catch {
-  // page already gone
-}
 await browser.close();
 
 // ---- Encode phase -----------------------------------------------------------
-if (frameTimes.length === 0) {
+if (frameCount === 0) {
   fs.rmSync(framesDir, { recursive: true, force: true });
   die('No frames were captured - nothing to encode.');
 }
 
-const recordedSeconds = (stoppedAt - startTime) / 1000;
-const averageFps = frameTimes.length / recordedSeconds;
+const recordedSeconds = videoSeconds;
+const averageFps = isSmooth ? fps : frameCount / recordedSeconds;
 
-// Each frame is shown from its capture time until the next frame's capture
-// time; the concat demuxer takes exactly that as per-frame durations, and the
-// fps filter resamples the result into constant frame rate. The video timeline
-// is therefore the capture timeline, whatever speed the encoder runs at.
-const MIN_DURATION = 0.001;
-const lastIndex = frameTimes.length;
-const lastName = `f_${String(lastIndex).padStart(6, '0')}.jpg`;
-const tailSeconds = Math.max(MIN_DURATION, (stoppedAt / 1000) - (startTime / 1000) - (frameTimes[lastIndex - 1] - frameTimes[0]));
-const listLines = ['ffconcat version 1.0'];
-for (let i = 0; i < lastIndex; i++) {
-  const name = `f_${String(i + 1).padStart(6, '0')}.jpg`;
-  const duration = i + 1 < lastIndex
-    ? Math.max(MIN_DURATION, frameTimes[i + 1] - frameTimes[i])
-    : tailSeconds;
-  listLines.push(`file '${name}'`, `duration ${duration.toFixed(6)}`);
+const encodeArgs = ['-y'];
+if (isSmooth) {
+  // Smooth mode produced one frame per 1/fps exactly - a plain image sequence.
+  encodeArgs.push('-framerate', String(fps), '-i', path.join(framesDir, 'f_%06d.jpg'), '-r', String(fps));
+} else {
+  // Realtime mode: each frame is shown from its capture time until the next
+  // frame's capture time; the concat demuxer takes exactly that as per-frame
+  // durations, and the fps filter resamples to constant rate. The timeline is
+  // the capture timeline, whatever speed the encoder runs at.
+  const MIN_DURATION = 0.001;
+  const lastIndex = frameTimes.length;
+  const tailSeconds = Math.max(MIN_DURATION, ((stoppedAt - startTime) / 1000) - (frameTimes[lastIndex - 1] - frameTimes[0]));
+  const listLines = ['ffconcat version 1.0'];
+  for (let i = 0; i < lastIndex; i++) {
+    const duration = i + 1 < lastIndex
+      ? Math.max(MIN_DURATION, frameTimes[i + 1] - frameTimes[i])
+      : tailSeconds;
+    listLines.push(`file '${frameName(i + 1)}'`, `duration ${duration.toFixed(6)}`);
+  }
+  // concat ignores the duration of the final entry unless it is listed again
+  listLines.push(`file '${frameName(lastIndex)}'`);
+  const listPath = path.join(framesDir, 'frames.ffconcat');
+  fs.writeFileSync(listPath, listLines.join('\n') + '\n');
+  encodeArgs.push('-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `fps=${fps}`, '-r', String(fps));
 }
-// concat ignores the duration of the final entry unless it is listed again
-listLines.push(`file '${lastName}'`);
-const listPath = path.join(framesDir, 'frames.ffconcat');
-fs.writeFileSync(listPath, listLines.join('\n') + '\n');
-
-const encodeArgs = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `fps=${fps}`, '-r', String(fps)];
 if (isMp4) {
   encodeArgs.push('-c:v', 'libx264', '-preset', x264Preset, '-crf', String(crf),
     '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
@@ -380,7 +518,7 @@ if (isMp4) {
 }
 encodeArgs.push(outputPath);
 
-console.log(`Encoding ${frameTimes.length} frames (${(bytesWritten / 1024 / 1024).toFixed(0)} MB) -> ${path.basename(outputPath)} ...`);
+console.log(`Encoding ${frameCount} frames (${(bytesWritten / 1024 / 1024).toFixed(0)} MB) -> ${path.basename(outputPath)} ...`);
 const encodeStarted = Date.now();
 const encoder = spawn(ffmpeg.path, encodeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 let encoderError = '';
@@ -416,9 +554,14 @@ if (args['keep-frames']) {
 const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
 const encodeSeconds = ((Date.now() - encodeStarted) / 1000).toFixed(1);
 console.log(`Done! Video saved to: ${outputPath}  (${sizeMb} MB, encoded in ${encodeSeconds}s)`);
-console.log(`Length:    ${recordedSeconds.toFixed(1)}s of recording -> ${recordedSeconds.toFixed(1)}s of video, real speed`);
-console.log(`Frames:    ${fps} fps in the file; browser painted ${averageFps.toFixed(1)} fps on average`);
-if (averageFps < fps * 0.75) {
-  console.log(`           ${averageFps.toFixed(1)} fps is below the ${fps} you asked for: at this size the browser cannot paint faster.`);
-  console.log(`           Transitions will still play at real speed, just with fewer distinct frames.`);
+if (isSmooth) {
+  console.log(`Length:    ${videoSeconds.toFixed(1)}s of video at a true ${fps} fps - every frame is a distinct render`);
+  console.log(`Capture:   took ${captureSeconds.toFixed(0)}s of real time (${(videoSeconds / captureSeconds).toFixed(2)}x)`);
+} else {
+  console.log(`Length:    ${recordedSeconds.toFixed(1)}s of recording -> ${recordedSeconds.toFixed(1)}s of video, real speed`);
+  console.log(`Frames:    ${fps} fps in the file; browser painted ${averageFps.toFixed(1)} fps on average`);
+  if (averageFps < fps * 0.75) {
+    console.log(`           ${averageFps.toFixed(1)} fps is below the ${fps} you asked for: at this size the browser cannot paint faster.`);
+    console.log(`           For guaranteed smoothness, drop --realtime/--manual and use the default smooth mode.`);
+  }
 }
