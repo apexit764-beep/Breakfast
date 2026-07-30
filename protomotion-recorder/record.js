@@ -14,12 +14,13 @@ const { values: args } = parseArgs({
     fps:      { type: 'string',              default: '60' },
     quality:  { type: 'string',  short: 'q', default: '18' },
     jpeg:     { type: 'string',              default: '92' },
-    preset:   { type: 'string',              default: 'ultrafast' },
+    preset:   { type: 'string',              default: 'veryfast' },
     maxdur:   { type: 'string',  short: 'm', default: '600' },
     pause:    { type: 'string',  short: 'p', default: '2' },
     manual:   { type: 'boolean', default: false },
     headless: { type: 'boolean', default: false },
     uncap:    { type: 'boolean', default: false },
+    'keep-frames': { type: 'boolean', default: false },
     debug:    { type: 'boolean', default: false },
   },
   strict: false,
@@ -32,6 +33,10 @@ if (!args.url) {
   Records a Figma prototype at exactly the size of your Figma frame: 1:1, no
   scaling, no zoom. Output is mp4 (H.264) at 60 fps by default.
 
+  Recording and encoding are two separate phases: while recording, frames are
+  only saved to disk (cheap), and the video is encoded after you stop. A slow
+  encoder can never slow down, stutter or slow-motion the recording.
+
   Usage:
     node record.js -u <figma-prototype-url> -w <frame width> -h <frame height>
 
@@ -40,19 +45,20 @@ if (!args.url) {
     -o, --output    Output file path; .mp4 or .webm (default: prototype.mp4)
     -w, --width     Frame width from Figma (default: 1920)
     -h, --height    Frame height from Figma (default: 1080)
-    --fps           Frames per second (default: 60)
+    --fps           Frames per second of the output (default: 60)
     -q, --quality   CRF quality, lower = better/bigger (default: 18)
     --jpeg          Quality of the frames grabbed from the browser, 1-100
-                    (default: 92). Lower is faster if the browser can't keep up
-    --preset        x264 speed/quality preset (default: ultrafast). Slower ones
-                    look a bit better but steal CPU from the browser
+                    (default: 92). Lower = smaller frames on disk
+    --preset        x264 encode preset, ultrafast..slow (default: veryfast).
+                    Encoding happens after recording, so slower is safe
     -m, --maxdur    Safety cap on recording length in seconds (default: 600)
     -p, --pause     Seconds to wait between auto-clicks (default: 2)
     --manual        You click manually in the browser, script only records
     --headless      Run without visible browser
     --uncap         Let Chromium paint without the vsync/frame-rate cap. Can
                     raise the frame rate, can also cause stutter - test both
-    --debug         Print canvas size changes + per-second frame timings
+    --keep-frames   Keep the captured .jpg frames folder next to the output
+    --debug         Print canvas size changes while recording
 
   Recording stops when you press Enter (or when --maxdur is reached).
   While recording, a stats line every 5s shows the real frame rate.
@@ -94,10 +100,10 @@ if (!Number.isFinite(jpegQuality) || jpegQuality < 1 || jpegQuality > 100) {
   die(`Invalid --jpeg "${args.jpeg}". Use 1-100; 92 is the default.`);
 }
 
-const X264_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'];
+const X264_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'];
 const x264Preset = String(args.preset).trim().toLowerCase();
 if (!X264_PRESETS.includes(x264Preset)) {
-  die(`Invalid --preset "${args.preset}". Use one of: ${X264_PRESETS.join(', ')}. Slower presets look better but steal CPU from the browser while recording.`);
+  die(`Invalid --preset "${args.preset}". Use one of: ${X264_PRESETS.join(', ')}.`);
 }
 
 const maxDuration = parseInt(args.maxdur) * 1000;
@@ -112,7 +118,7 @@ if (!['.mp4', '.webm'].includes(outputExt)) {
 const isMp4 = outputExt === '.mp4';
 
 // ffmpeg does the encoding. Prefer a full build (H.264 + mp4); the one bundled
-// with Playwright is VP8/webm only, so it is the last resort.
+// with Playwright is VP8/webm only and has no concat demuxer, so it won't do.
 function resolveFfmpeg() {
   const candidates = [];
   if (process.env.FFMPEG_PATH) candidates.push(process.env.FFMPEG_PATH);
@@ -128,12 +134,12 @@ function resolveFfmpeg() {
     const probe = spawnSync(candidate, ['-hide_banner', '-encoders'], { encoding: 'utf8' });
     if (probe.error || probe.status !== 0) continue;
     const encoders = probe.stdout || '';
-    const filters = spawnSync(candidate, ['-hide_banner', '-filters'], { encoding: 'utf8' }).stdout || '';
+    const demuxers = spawnSync(candidate, ['-hide_banner', '-demuxers'], { encoding: 'utf8' }).stdout || '';
     return {
       path: candidate,
       canH264: /libx264/.test(encoders),
       canVp9: /libvpx-vp9/.test(encoders),
-      canFps: /(^|\s)fps(\s|$)/m.test(filters),
+      canConcat: /(^|\s)concat(\s|$)/m.test(demuxers),
     };
   }
   return null;
@@ -143,9 +149,17 @@ const ffmpeg = resolveFfmpeg();
 if (!ffmpeg) {
   die('No ffmpeg found. Run "npm install" in this folder (it installs one), or install ffmpeg and put it on your PATH.');
 }
+if (!ffmpeg.canConcat) {
+  die(`The ffmpeg found at ${ffmpeg.path} has no concat demuxer.\nRun "npm install" in this folder to get a full build.`);
+}
 if (isMp4 && !ffmpeg.canH264) {
   die(`The ffmpeg found at ${ffmpeg.path} cannot write mp4 (no libx264).\nRun "npm install" in this folder to get a full build, or record to .webm instead.`);
 }
+
+// Frames are captured to disk first, encoded after the recording stops.
+const framesDir = path.join(path.dirname(outputPath),
+  `.${path.basename(outputPath).replace(/\.[^.]+$/, '')}-frames-${process.pid}`);
+fs.mkdirSync(framesDir, { recursive: true });
 
 // Force 1:1 presentation + hide UI. min-zoom keeps the frame at 100%: the window
 // is already exactly the frame size, so nothing is scaled either way.
@@ -204,62 +218,28 @@ await page.evaluate(() => {
 
 await page.waitForTimeout(500);
 
-// ---- Recording engine -------------------------------------------------------
-// Playwright's built-in recorder is locked to 25 fps / 1 Mbps webm, so we drive
-// the capture ourselves: Chromium streams JPEG frames over CDP, each frame is
-// written to ffmpeg once with its arrival time, and ffmpeg's fps filter turns
-// that into a constant-rate video. Writing every frame only once (instead of
-// padding to 60/s in Node) keeps the pipe small, which is what stops the
-// recording from degrading as it gets longer.
-const videoFilters = [`fps=${fps}`];
-const ffmpegArgs = [
-  '-y',
-  '-f', 'image2pipe',
-  '-use_wallclock_as_timestamps', '1',
-  '-i', '-',
-];
-if (ffmpeg.canFps) ffmpegArgs.push('-vf', videoFilters.join(','));
-ffmpegArgs.push('-r', String(fps));
-if (isMp4) {
-  ffmpegArgs.push('-c:v', 'libx264', '-preset', x264Preset, '-crf', String(crf),
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
-} else if (ffmpeg.canVp9) {
-  ffmpegArgs.push('-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0',
-    '-deadline', 'realtime', '-cpu-used', '5', '-pix_fmt', 'yuv420p');
-} else {
-  ffmpegArgs.push('-c:v', 'libvpx', '-crf', String(crf), '-b:v', '12M',
-    '-deadline', 'realtime', '-speed', '8');
-}
-ffmpegArgs.push(outputPath);
-
-const encoder = spawn(ffmpeg.path, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
-let encoderError = '';
-encoder.stderr.on('data', (chunk) => { encoderError += chunk.toString(); });
-encoder.stdin.on('error', () => {});
-const encoderExit = new Promise((resolve) => encoder.on('close', resolve));
-
-// If ffmpeg ever falls behind, drop frames instead of letting Node buffer them:
-// a dropped frame costs one repeated frame in the video, a growing buffer costs
-// the whole recording.
-const QUEUE_LIMIT = 48 * 1024 * 1024;
-let captured = 0;
-let dropped = 0;
-let peakQueue = 0;
-
-let lastFrame = null;
+// ---- Capture phase ----------------------------------------------------------
+// Chromium streams JPEG frames over CDP; each one is written straight to disk
+// together with its CAPTURE time. Nothing else competes for the CPU while
+// recording. Timing the frames at capture (instead of when an encoder gets
+// round to reading them) is what keeps the video at real speed: stamping them
+// at read time stretches the timeline whenever encoding lags, which shows up
+// as slow motion.
+const frameTimes = [];
+let bytesWritten = 0;
 
 const cdp = await context.newCDPSession(page);
 cdp.on('Page.screencastFrame', (frame) => {
   const ack = cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
-  const queued = encoder.stdin.writableLength;
-  if (queued > peakQueue) peakQueue = queued;
-  if (encoder.stdin.destroyed || queued > QUEUE_LIMIT) {
-    dropped++;
-    return ack;
+  const buffer = Buffer.from(frame.data, 'base64');
+  const index = frameTimes.length + 1;
+  try {
+    fs.writeFileSync(path.join(framesDir, `f_${String(index).padStart(6, '0')}.jpg`), buffer);
+  } catch (error) {
+    die(`Cannot write frames to ${framesDir}: ${error.message}`);
   }
-  lastFrame = Buffer.from(frame.data, 'base64');
-  encoder.stdin.write(lastFrame);
-  captured++;
+  frameTimes.push(frame.metadata?.timestamp ?? Date.now() / 1000);
+  bytesWritten += buffer.length;
   return ack;
 });
 
@@ -293,26 +273,16 @@ let lastClickTime = 0;
 let lastProbe = '';
 let stopReason = '';
 
-// Live stats: the frame rate in the last window, how much is queued for ffmpeg,
-// and our own memory. If the recording degrades over time, this shows which one
-// of the three is going wrong.
+// Live stats: real painted frame rate + disk usage of the captured frames.
 let statsAt = startTime;
 let statsFrames = 0;
-let statsDropped = 0;
-const statsHistory = [];
 const statsTimer = setInterval(() => {
   const now = Date.now();
-  const seconds = (now - statsAt) / 1000;
-  const rate = (captured - statsFrames) / seconds;
-  const drops = dropped - statsDropped;
-  const queueMb = encoder.stdin.writableLength / 1024 / 1024;
-  const rssMb = process.memoryUsage().rss / 1024 / 1024;
-  statsHistory.push({ at: Math.round((now - startTime) / 1000), rate, drops, queueMb, rssMb });
-  console.log(`[${String(Math.round((now - startTime) / 1000)).padStart(3)}s] ${rate.toFixed(1)} fps painted` +
-    `${drops ? `  ${drops} dropped` : ''}  queue ${queueMb.toFixed(1)} MB  rss ${rssMb.toFixed(0)} MB`);
+  const rate = (frameTimes.length - statsFrames) / ((now - statsAt) / 1000);
+  console.log(`[${String(Math.round((now - startTime) / 1000)).padStart(3)}s] ` +
+    `${rate.toFixed(1)} fps painted  frames ${frameTimes.length}  disk ${(bytesWritten / 1024 / 1024).toFixed(0)} MB`);
   statsAt = now;
-  statsFrames = captured;
-  statsDropped = dropped;
+  statsFrames = frameTimes.length;
 }, 5000);
 
 while (Date.now() - startTime < maxDuration) {
@@ -361,51 +331,94 @@ if (!stopReason) {
 }
 console.log(stopReason);
 
-const recordedSeconds = (Date.now() - startTime) / 1000;
+const stoppedAt = Date.now();
 try {
   await cdp.send('Page.stopScreencast');
 } catch {
   // page already gone
 }
-
-// One last frame stamped at the stop moment, so the video ends where the
-// recording ended instead of at the last frame the prototype happened to paint.
-if (lastFrame && !encoder.stdin.destroyed) encoder.stdin.write(lastFrame);
-
-console.log('Encoding video...');
-encoder.stdin.end();
-const encoderCode = await encoderExit;
-
 await browser.close();
+
+// ---- Encode phase -----------------------------------------------------------
+if (frameTimes.length === 0) {
+  fs.rmSync(framesDir, { recursive: true, force: true });
+  die('No frames were captured - nothing to encode.');
+}
+
+const recordedSeconds = (stoppedAt - startTime) / 1000;
+const averageFps = frameTimes.length / recordedSeconds;
+
+// Each frame is shown from its capture time until the next frame's capture
+// time; the concat demuxer takes exactly that as per-frame durations, and the
+// fps filter resamples the result into constant frame rate. The video timeline
+// is therefore the capture timeline, whatever speed the encoder runs at.
+const MIN_DURATION = 0.001;
+const lastIndex = frameTimes.length;
+const lastName = `f_${String(lastIndex).padStart(6, '0')}.jpg`;
+const tailSeconds = Math.max(MIN_DURATION, (stoppedAt / 1000) - (startTime / 1000) - (frameTimes[lastIndex - 1] - frameTimes[0]));
+const listLines = ['ffconcat version 1.0'];
+for (let i = 0; i < lastIndex; i++) {
+  const name = `f_${String(i + 1).padStart(6, '0')}.jpg`;
+  const duration = i + 1 < lastIndex
+    ? Math.max(MIN_DURATION, frameTimes[i + 1] - frameTimes[i])
+    : tailSeconds;
+  listLines.push(`file '${name}'`, `duration ${duration.toFixed(6)}`);
+}
+// concat ignores the duration of the final entry unless it is listed again
+listLines.push(`file '${lastName}'`);
+const listPath = path.join(framesDir, 'frames.ffconcat');
+fs.writeFileSync(listPath, listLines.join('\n') + '\n');
+
+const encodeArgs = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-vf', `fps=${fps}`, '-r', String(fps)];
+if (isMp4) {
+  encodeArgs.push('-c:v', 'libx264', '-preset', x264Preset, '-crf', String(crf),
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart');
+} else if (ffmpeg.canVp9) {
+  encodeArgs.push('-c:v', 'libvpx-vp9', '-crf', String(crf), '-b:v', '0', '-pix_fmt', 'yuv420p');
+} else {
+  encodeArgs.push('-c:v', 'libvpx', '-crf', String(crf), '-b:v', '12M');
+}
+encodeArgs.push(outputPath);
+
+console.log(`Encoding ${frameTimes.length} frames (${(bytesWritten / 1024 / 1024).toFixed(0)} MB) -> ${path.basename(outputPath)} ...`);
+const encodeStarted = Date.now();
+const encoder = spawn(ffmpeg.path, encodeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+let encoderError = '';
+let lastReport = '';
+encoder.stderr.on('data', (chunk) => {
+  encoderError += chunk.toString();
+  const match = encoderError.match(/time=(\d+):(\d+):(\d+\.\d+)(?![\s\S]*time=)/);
+  if (match) {
+    const done = (+match[1] * 3600 + +match[2] * 60 + +match[3]);
+    const report = `  encoded ${done.toFixed(0)}s / ${recordedSeconds.toFixed(0)}s`;
+    if (report !== lastReport) {
+      process.stdout.write(report + '\r');
+      lastReport = report;
+    }
+  }
+});
+const encoderCode = await new Promise((resolve) => encoder.on('close', resolve));
+process.stdout.write('\n');
 
 if (encoderCode !== 0 || !fs.existsSync(outputPath)) {
   console.error(`ffmpeg failed (exit ${encoderCode}):`);
-  console.error(encoderError.split('\n').slice(-12).join('\n'));
+  console.error(encoderError.split('\n').filter(Boolean).slice(-12).join('\n'));
+  console.error(`The captured frames were kept in: ${framesDir}`);
   process.exit(1);
 }
 
-const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
-const averageFps = captured / recordedSeconds;
-console.log(`Done! Video saved to: ${outputPath}  (${sizeMb} MB)`);
-console.log(`Frames:    ${fps} fps in the file; browser painted ${averageFps.toFixed(1)} fps on average` +
-  `${dropped ? `; ${dropped} frames dropped because the encoder fell behind` : ''}`);
-
-// Point at the likely culprit when the recording was not smooth.
-if (statsHistory.length >= 2) {
-  const first = statsHistory[0];
-  const last = statsHistory[statsHistory.length - 1];
-  if (last.rate < first.rate * 0.7) {
-    console.log(`Warning:   the frame rate fell from ${first.rate.toFixed(1)} to ${last.rate.toFixed(1)} fps during the recording.`);
-    if (peakQueue > 8 * 1024 * 1024 || dropped) {
-      console.log(`           The encoder was the bottleneck (queue peaked at ${(peakQueue / 1024 / 1024).toFixed(1)} MB).`);
-      console.log(`           Try --fps 30, or --jpeg 75, or a smaller -w/-h.`);
-    } else {
-      console.log(`           The encoder kept up, so the browser itself slowed down.`);
-      console.log(`           Try --jpeg 75, close other apps, and record shorter takes.`);
-      if (args.uncap) console.log(`           Also try again without --uncap.`);
-    }
-  }
+if (args['keep-frames']) {
+  console.log(`Frames kept in: ${framesDir}`);
+} else {
+  fs.rmSync(framesDir, { recursive: true, force: true });
 }
+
+const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
+const encodeSeconds = ((Date.now() - encodeStarted) / 1000).toFixed(1);
+console.log(`Done! Video saved to: ${outputPath}  (${sizeMb} MB, encoded in ${encodeSeconds}s)`);
+console.log(`Length:    ${recordedSeconds.toFixed(1)}s of recording -> ${recordedSeconds.toFixed(1)}s of video, real speed`);
+console.log(`Frames:    ${fps} fps in the file; browser painted ${averageFps.toFixed(1)} fps on average`);
 if (averageFps < fps * 0.75) {
-  console.log(`           ${averageFps.toFixed(1)} fps is below the ${fps} you asked for: at this size the browser cannot paint that fast.`);
+  console.log(`           ${averageFps.toFixed(1)} fps is below the ${fps} you asked for: at this size the browser cannot paint faster.`);
+  console.log(`           Transitions will still play at real speed, just with fewer distinct frames.`);
 }
